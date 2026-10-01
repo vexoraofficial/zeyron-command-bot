@@ -1,17 +1,14 @@
 /* ==========================================================
-   ZEYRON COMMAND — BOT TELEGRAM v6.0 FINAL
+   ZEYRON COMMAND — BOT TELEGRAM v7.1 FINAL
    File: bot.js
    
-   FITUR:
-   • Auto-generate akun (member, permanent, admin, owner, style)
-   • Pool system (FIFO) + auto-generate on demand
-   • Payment QRIS (Pakasir / Demo)
-   • Auto-delivery akun ke Telegram user
-   • Multi-role support (Developer tetap Developer)
-   • Base64 service account (Railway/Render friendly)
-   • Webhook endpoints lengkap
-   • Error handling + logging bersih
-   • Support VPS / Railway / Render / Fly.io
+   FITUR v7.1:
+   • Custom username & password di /generate
+   • Dual-write fields (wallet+balance, expires+expired)
+   • Akun generate LANGSUNG login di index.html
+   • Auto-validation username unik
+   • Commands: /checkuser /testlogin /syncusers /fixuser /diag
+   • Fix bug /bulk sendDocument
    ========================================================== */
 
 const express = require('express');
@@ -24,119 +21,78 @@ const crypto = require('crypto');
    CONFIG
    ========================================================== */
 const CONFIG = {
-    // Telegram
     BOT_TOKEN: process.env.BOT_TOKEN || '8929798096:AAFrynjFbR9ejXt_N2kvnGSe4xv5sNbCXb8',
     OWNER_ID: parseInt(process.env.OWNER_ID || '8790176339'),
     ADMIN_CHAT: parseInt(process.env.ADMIN_CHAT || '-1004425930502'),
 
-    // Server
     PORT: process.env.PORT || 3000,
     BASE_URL: process.env.BASE_URL || 'http://localhost:3000',
 
-    // Payment Gateway
-    PAYMENT_PROVIDER: process.env.PAYMENT_PROVIDER || 'demo', // demo | pakasir | tripay
+    PAYMENT_PROVIDER: process.env.PAYMENT_PROVIDER || 'demo',
     PAYMENT_API_KEY: process.env.PAYMENT_API_KEY || '',
     PAYMENT_PROJECT: process.env.PAYMENT_PROJECT || 'zeyron-command',
     PAYMENT_MERCHANT: process.env.PAYMENT_MERCHANT || 'ZEYRON COMMAND',
 
-    // Webhook secret
     WEBHOOK_SECRET: process.env.WEBHOOK_SECRET || 'zeyron_secret_2026',
-
-    // Firebase
     SERVICE_ACCOUNT_PATH: process.env.SERVICE_ACCOUNT_PATH || './serviceAccountKey.json'
 };
 
 /* ==========================================================
-   ACCOUNT TYPES (Jenis akun yang bisa di-generate)
+   ACCOUNT TYPES
    ========================================================== */
 const ACCOUNT_TYPES = {
     member: {
-        id: 'member',
-        name: 'Member Premium',
-        prefix: 'mbr',
-        needsDuration: true,
-        minDays: 1,
-        maxDays: 10,
-        defaultDays: 7,
-        permanent: false,
-        loginRole: 'premium',
-        pricePerDay: 3000
+        id: 'member', name: 'Member Premium', prefix: 'mbr',
+        needsDuration: true, minDays: 1, maxDays: 10, defaultDays: 7,
+        permanent: false, loginRole: 'premium', pricePerDay: 3000
     },
     permanent: {
-        id: 'permanent',
-        name: 'Premium Permanent',
-        prefix: 'prm',
-        needsDuration: false,
-        permanent: true,
-        loginRole: 'premium',
-        price: 45000
+        id: 'permanent', name: 'Premium Permanent', prefix: 'prm',
+        needsDuration: false, permanent: true, loginRole: 'premium', price: 45000
     },
     reseller: {
-        id: 'reseller',
-        name: 'Reseller',
-        prefix: 'rsl',
-        needsDuration: false,
-        permanent: true,
-        loginRole: 'reseller',
-        price: 75000
+        id: 'reseller', name: 'Reseller', prefix: 'rsl',
+        needsDuration: false, permanent: true, loginRole: 'reseller', price: 75000
     },
     admin: {
-        id: 'admin',
-        name: 'Admin',
-        prefix: 'adm',
-        needsDuration: false,
-        permanent: true,
-        loginRole: 'admin',
-        price: 100000
+        id: 'admin', name: 'Admin', prefix: 'adm',
+        needsDuration: false, permanent: true, loginRole: 'admin', price: 100000
     },
     owner: {
-        id: 'owner',
-        name: 'Owner',
-        prefix: 'own',
-        needsDuration: false,
-        permanent: true,
-        loginRole: 'owner',
-        price: 250000
+        id: 'owner', name: 'Owner', prefix: 'own',
+        needsDuration: false, permanent: true, loginRole: 'owner', price: 250000
     },
     style: {
-        id: 'style',
-        name: 'Style',
-        prefix: 'sty',
-        needsDuration: false,
-        permanent: true,
-        loginRole: 'premium',
-        price: 25000
+        id: 'style', name: 'Style', prefix: 'sty',
+        needsDuration: false, permanent: true, loginRole: 'premium', price: 25000
     }
 };
 
 /* ==========================================================
-   FIREBASE INIT (Support Base64 + File)
+   FIREBASE INIT
    ========================================================== */
 let db, FieldValue, Timestamp;
 
 try {
     let serviceAccount;
-
     if (process.env.FIREBASE_KEY_BASE64) {
-        // Production (Railway/Render) - Base64 dari env
         const json = Buffer.from(process.env.FIREBASE_KEY_BASE64, 'base64').toString('utf8');
         serviceAccount = JSON.parse(json);
         console.log('🔥 Firebase: BASE64 from env');
     } else {
-        // Local dev - file JSON
         serviceAccount = require(CONFIG.SERVICE_ACCOUNT_PATH);
         console.log('🔥 Firebase: Local file');
     }
 
-    admin.initializeApp({
-        credential: admin.credential.cert(serviceAccount)
-    });
-
+    admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
     db = admin.firestore();
     FieldValue = admin.firestore.FieldValue;
     Timestamp = admin.firestore.Timestamp;
 
     console.log('✅ Firebase Admin connected');
+    console.log('📌 Project ID  :', serviceAccount.project_id);
+    console.log('📌 Client Email:', serviceAccount.client_email);
+    console.log('⚠️  Pastikan projectId di index.html SAMA dengan ini!');
 } catch (e) {
     console.error('❌ Firebase init error:', e.message);
     process.exit(1);
@@ -146,7 +102,6 @@ try {
    TELEGRAM BOT INIT
    ========================================================== */
 let bot;
-
 try {
     bot = new TelegramBot(CONFIG.BOT_TOKEN, { polling: true });
     console.log('🤖 Bot Telegram connected');
@@ -156,7 +111,7 @@ try {
 }
 
 /* ==========================================================
-   HELPER FUNCTIONS
+   HELPERS
    ========================================================== */
 function rupiah(n) {
     return 'Rp ' + Number(n || 0).toLocaleString('id-ID');
@@ -185,19 +140,137 @@ function generatePassword(length = 10) {
 function calculateExpiry(typeId, days) {
     const type = ACCOUNT_TYPES[typeId];
     if (!type || type.permanent) return null;
-
     const d = parseInt(days) || type.defaultDays || 7;
     return Timestamp.fromDate(new Date(Date.now() + d * 86400000));
 }
 
-function getTodayKey() {
-    return new Date().toISOString().slice(0, 10);
+/* ==========================================================
+   🆕 VALIDATORS — untuk custom username & password
+   ========================================================== */
+function validateUsername(username) {
+    if (!username || typeof username !== 'string') {
+        return { ok: false, error: 'Username wajib diisi' };
+    }
+    const u = username.trim();
+    if (u.length < 3) return { ok: false, error: 'Username minimal 3 karakter' };
+    if (u.length > 30) return { ok: false, error: 'Username maksimal 30 karakter' };
+    if (!/^[a-zA-Z0-9_.-]+$/.test(u)) {
+        return { ok: false, error: 'Username hanya boleh huruf, angka, titik, underscore, dan strip' };
+    }
+    if (/^[_.-]/.test(u)) {
+        return { ok: false, error: 'Username tidak boleh diawali titik/underscore/strip' };
+    }
+    return { ok: true, value: u };
+}
+
+function validatePassword(password) {
+    if (!password || typeof password !== 'string') {
+        return { ok: false, error: 'Password wajib diisi' };
+    }
+    if (password.length < 3) return { ok: false, error: 'Password minimal 3 karakter' };
+    if (password.length > 64) return { ok: false, error: 'Password maksimal 64 karakter' };
+    return { ok: true, value: password };
+}
+
+async function isUsernameTaken(username) {
+    if (!username) return false;
+    const u = String(username).trim().toLowerCase();
+
+    // Cek di users collection
+    try {
+        const userSnap = await db.collection('users').doc(username).get();
+        if (userSnap.exists) return true;
+
+        // Cek variasi case
+        const q = await db.collection('users')
+            .where('username', '==', username).limit(1).get();
+        if (!q.empty) return true;
+
+        // Cek di pool juga
+        const poolQ = await db.collection('account_pool')
+            .where('username', '==', username).limit(1).get();
+        if (!poolQ.empty) return true;
+    } catch (e) {
+        console.warn('isUsernameTaken error:', e.message);
+    }
+    return false;
 }
 
 /* ==========================================================
-   ACCOUNT GENERATOR
+   🔥 CORE BUILDER — userData COMPATIBLE (index.html + home.html)
+   Menulis DUA format sekaligus agar bisa login di mana saja.
    ========================================================== */
-async function generateAccount(typeId, days, generatedBy = 'system') {
+function buildUserData(params) {
+    const {
+        username, password, role, expires,
+        typeId, typeName, days, generatedBy,
+        source = 'bot_generator'
+    } = params;
+
+    // Normalisasi expired (home.html Part 3)
+    const expiredVal = (expires === 'never' || !expires) ? null : expires;
+
+    return {
+        /* IDENTITY */
+        username,
+        password,
+        role,                       // 'premium' | 'reseller' | 'admin' | 'owner'
+
+        /* MASA AKTIF (DUAL) */
+        expires,                    // index.html: 'never' | 'YYYY-MM-DD'
+        expired: expiredVal,        // home.html: null | 'YYYY-MM-DD'
+
+        /* SALDO (DUAL) */
+        wallet: 0,
+        balance: 0,
+
+        /* PROFILE */
+        avatar: '',
+        email: '',
+        phone: '',
+
+        /* STATUS */
+        banned: false,
+        banReason: '',
+
+        /* METADATA (DUAL) */
+        createdAt: new Date().toISOString(),
+        joinedAt: new Date().toISOString(),
+
+        /* EXTRA */
+        type: typeId,
+        typeName: typeName,
+        days: days || null,
+        generatedBy: generatedBy || 'system',
+        source,
+        referral: 'REF-' + String(username).slice(0, 4).toUpperCase() +
+                  crypto.randomBytes(2).toString('hex').toUpperCase(),
+
+        /* GAME DATA */
+        themes: [],
+        achievements: [],
+        exp: 0,
+        additionalRoles: [],
+
+        /* TIMESTAMPS */
+        lastSeen: new Date().toISOString(),
+        roleUpdatedAt: new Date().toISOString(),
+
+        /* FLAG */
+        loginReady: true
+    };
+}
+
+/* ==========================================================
+   ACCOUNT GENERATOR v7.1 (dengan custom username/password)
+   
+   @param typeId       - 'member' | 'permanent' | dst
+   @param days         - durasi hari (untuk member)
+   @param generatedBy  - siapa yang generate
+   @param customUser   - (opsional) username custom
+   @param customPass   - (opsional) password custom
+   ========================================================== */
+async function generateAccount(typeId, days, generatedBy = 'system', customUser = null, customPass = null) {
     const type = ACCOUNT_TYPES[typeId];
     if (!type) throw new Error(`Tipe "${typeId}" tidak valid`);
 
@@ -209,14 +282,47 @@ async function generateAccount(typeId, days, generatedBy = 'system') {
         }
     }
 
-    const username = generateUsername(typeId);
-    const password = generatePassword(10);
+    /* ===== CUSTOM USERNAME VALIDATION ===== */
+    let username;
+    if (customUser) {
+        const v = validateUsername(customUser);
+        if (!v.ok) throw new Error('Username: ' + v.error);
+
+        const taken = await isUsernameTaken(v.value);
+        if (taken) throw new Error(`Username "${v.value}" sudah dipakai`);
+
+        username = v.value;
+    } else {
+        // Generate random, pastikan tidak bentrok
+        let attempts = 0;
+        do {
+            username = generateUsername(typeId);
+            attempts++;
+        } while (await isUsernameTaken(username) && attempts < 10);
+    }
+
+    /* ===== CUSTOM PASSWORD VALIDATION ===== */
+    let password;
+    if (customPass) {
+        const v = validatePassword(customPass);
+        if (!v.ok) throw new Error('Password: ' + v.error);
+        password = v.value;
+    } else {
+        password = generatePassword(10);
+    }
+
     const expiresAt = calculateExpiry(typeId, days);
+
+    let expires;
+    if (type.permanent || !expiresAt) {
+        expires = 'never';
+    } else {
+        expires = expiresAt.toDate().toISOString().slice(0, 10);
+    }
 
     /* ===== 1. SIMPAN KE POOL ===== */
     const poolData = {
-        username,
-        password,
+        username, password,
         type: typeId,
         typeName: type.name,
         roleId: typeId,
@@ -227,70 +333,51 @@ async function generateAccount(typeId, days, generatedBy = 'system') {
         status: 'available',
         generatedBy,
         generatedAt: FieldValue.serverTimestamp(),
-        usedBy: null,
-        usedAt: null,
-        invoice: null
+        usedBy: null, usedAt: null, invoice: null,
+        isCustom: !!(customUser || customPass)
     };
 
     const poolRef = await db.collection('account_pool').add(poolData);
 
-    /* ===== 2. SIMPAN KE USERS (untuk login home.html) ===== */
-    let expires;
-    if (type.permanent || !expiresAt) {
-        expires = 'never';
-    } else {
-        expires = expiresAt.toDate().toISOString().slice(0, 10);
-    }
-
-    const userData = {
-        username,
-        password,
+    /* ===== 2. SIMPAN KE USERS ===== */
+    const userData = buildUserData({
+        username, password,
         role: type.loginRole,
         expires,
-        wallet: 0,
-        banned: false,
-        banReason: '',
-        createdAt: new Date().toISOString(),
-        type: typeId,
+        typeId,
         typeName: type.name,
         days: type.needsDuration ? parseInt(days) : null,
         generatedBy,
-        source: 'bot_generator',
-        avatar: './assets/avatar-default.png',
-        themes: [],
-        achievements: [],
-        exp: 0,
-        additionalRoles: []
-    };
+        source: 'bot_generator'
+    });
 
     await db.collection('users').doc(username).set(userData);
 
-    console.log(`✅ Akun generated: ${username} | ${type.name} | ${expires}`);
+    console.log(`✅ Generated: ${username} | ${type.name} | role=${type.loginRole} | exp=${expires}`);
 
     return {
         poolId: poolRef.id,
-        username,
-        password,
+        username, password,
         role: type.loginRole,
         expires,
         type: typeId,
         typeName: type.name,
         days: type.needsDuration ? parseInt(days) : null,
         permanent: type.permanent,
-        expiresAt
+        expiresAt,
+        userData,
+        isCustom: !!(customUser || customPass)
     };
 }
 
 /* ==========================================================
-   CLAIM ACCOUNT (saat user beli)
+   CLAIM ACCOUNT
    ========================================================== */
 async function claimAccount(roleId, telegram, invoice) {
-    // Map roleId ke typeId
     let typeId = roleId;
     if (roleId === 'premium_custom') typeId = 'member';
     if (roleId === 'premium_perm') typeId = 'permanent';
 
-    // Cari akun available di pool
     const snap = await db.collection('account_pool')
         .where('type', '==', typeId)
         .where('status', '==', 'available')
@@ -308,7 +395,7 @@ async function claimAccount(roleId, telegram, invoice) {
             invoice
         });
 
-        console.log(`📦 Claimed from pool: ${data.username} → ${telegram}`);
+        console.log(`📦 Claimed: ${data.username} → ${telegram}`);
 
         return {
             username: data.username,
@@ -346,20 +433,46 @@ async function getStock() {
             .where('type', '==', typeId)
             .where('status', '==', 'available')
             .get();
-
-        stock[typeId] = {
-            name: type.name,
-            available: snap.size
-        };
+        stock[typeId] = { name: type.name, available: snap.size };
     }
     return stock;
+}
+
+/* ==========================================================
+   🆕 SEND ACCOUNT TO TELEGRAM (reusable)
+   ========================================================== */
+async function sendAccountMessage(chatId, acc, extra = {}) {
+    const expText = acc.expiresAt
+        ? acc.expiresAt.toDate().toLocaleString('id-ID')
+        : (acc.expires === 'never' || acc.permanent ? '♾️ Permanent' : '-');
+
+    const durText = acc.days
+        ? `${acc.days} hari`
+        : (acc.permanent ? 'Permanent' : '-');
+
+    const customTag = acc.isCustom ? '\n🎨 *CUSTOM* oleh owner' : '';
+
+    let text = `✅ *AKUN SIAP LOGIN*${customTag}\n\n`;
+    text += `📦 Tipe: *${acc.typeName}*\n`;
+    text += `🎭 Role Login: \`${acc.role}\`\n`;
+    text += `⏳ Durasi: ${durText}\n`;
+    text += `📅 Expired: ${expText}\n`;
+    text += `━━━━━━━━━━━━━━━━━━\n`;
+    text += `👤 Username: \`${acc.username}\`\n`;
+    text += `🔑 Password: \`${acc.password}\`\n`;
+    text += `━━━━━━━━━━━━━━━━━━\n`;
+    text += `💾 Pool: available ✅\n`;
+    text += `🔐 Login: *index.html* siap ✅`;
+
+    if (extra.footer) text += '\n\n' + extra.footer;
+
+    return bot.sendMessage(chatId, text, { parse_mode: 'Markdown' });
 }
 
 /* ==========================================================
    BOT COMMANDS — USER
    ========================================================== */
 
-// /start
 bot.onText(/\/start/, (msg) => {
     const name = msg.from.first_name || 'User';
     bot.sendMessage(msg.chat.id,
@@ -375,12 +488,10 @@ bot.onText(/\/start/, (msg) => {
     );
 });
 
-// /help
 bot.onText(/\/help/, (msg) => {
     const isOwner = msg.from.id === CONFIG.OWNER_ID;
-
     let text = `📖 *BANTUAN ZEYRON COMMAND*\n\n`;
-    text += `*User Commands:*\n`;
+    text += `*User:*\n`;
     text += `• /start — Menu utama\n`;
     text += `• /riwayat — Riwayat pembelian\n`;
     text += `• /expired — Cek masa aktif\n`;
@@ -391,24 +502,27 @@ bot.onText(/\/help/, (msg) => {
     if (isOwner) {
         text += `\n*👑 Admin Commands:*\n`;
         text += `• /roles — List tipe akun\n`;
-        text += `• /generate \\<type\\> \\[hari\\]\n`;
-        text += `• /bulk \\<n\\> \\<type\\> \\[hari\\]\n`;
-        text += `• /stock — Cek stok semua\n`;
-        text += `• /accounts \\[type\\] — List akun\n`;
+        text += `• \`/generate <type> [hari] [user] [pass]\`\n`;
+        text += `• \`/bulk <n> <type> [hari]\`\n`;
+        text += `• /stock — Cek stok\n`;
+        text += `• /accounts [type] — List akun\n`;
+        text += `• /checkuser \\<username\\> — Cek bisa login\n`;
+        text += `• /testlogin \\<user\\> \\<pass\\> — Simulasi login\n`;
+        text += `• /fixuser \\<username\\> — Fix 1 akun\n`;
+        text += `• /syncusers — Fix semua akun lama\n`;
         text += `• /deleteaccount \\<username\\>\n`;
         text += `• /clearused — Clear akun terpakai\n`;
         text += `• /migratepool — Migrate pool ke users\n`;
         text += `• /stats — Statistik\n`;
+        text += `• /diag — Diagnostik Firebase\n`;
         text += `• /broadcast \\<pesan\\>\n`;
     }
 
     bot.sendMessage(msg.chat.id, text, { parse_mode: 'Markdown' });
 });
 
-// /roles
 bot.onText(/\/roles/, (msg) => {
     let text = `📋 *TIPE AKUN*\n━━━━━━━━━━━━━━━━━━\n\n`;
-
     for (const [id, type] of Object.entries(ACCOUNT_TYPES)) {
         text += `*${type.name}*\n`;
         text += `   ID: \`${id}\`\n`;
@@ -424,44 +538,34 @@ bot.onText(/\/roles/, (msg) => {
         }
         text += `\n`;
     }
-
-    text += `_Contoh: /generate member 7_`;
+    text += `*Contoh Generate:*\n`;
+    text += `• \`/generate member 7\` (random)\n`;
+    text += `• \`/generate member 7 myuser mypass\` (custom)\n`;
+    text += `• \`/generate permanent premiumku pass123\`\n`;
     bot.sendMessage(msg.chat.id, text, { parse_mode: 'Markdown' });
 });
 
-// /riwayat
 bot.onText(/\/riwayat/, async (msg) => {
     const chatId = msg.chat.id;
     const tg = '@' + (msg.from.username || msg.from.id);
 
     try {
         bot.sendChatAction(chatId, 'typing');
-
         const snap = await db.collection('transactions')
             .where('telegram', '==', tg)
-            .orderBy('createdAt', 'desc')
-            .limit(10)
-            .get();
+            .orderBy('createdAt', 'desc').limit(10).get();
 
-        if (snap.empty) {
-            return bot.sendMessage(chatId, '📭 Belum ada transaksi');
-        }
+        if (snap.empty) return bot.sendMessage(chatId, '📭 Belum ada transaksi');
 
         let t = `📚 *Riwayat Pembelian*\n━━━━━━━━━━━━━━━━━━\n\n`;
-
         snap.forEach((d, i) => {
             const x = d.data();
             const st = x.status === 'paid' ? '✅ LUNAS' : '⏳ PENDING';
             const date = x.createdAt
-                ? new Date(x.createdAt.toDate()).toLocaleDateString('id-ID')
-                : '-';
-
+                ? new Date(x.createdAt.toDate()).toLocaleDateString('id-ID') : '-';
             t += `*${i + 1}. ${x.invoice}*\n`;
-            t += `   ${x.roleName}\n`;
-            t += `   ${st} • ${rupiah(x.total)}\n`;
-            t += `   📅 ${date}\n\n`;
+            t += `   ${x.roleName}\n   ${st} • ${rupiah(x.total)}\n   📅 ${date}\n\n`;
         });
-
         bot.sendMessage(chatId, t, { parse_mode: 'Markdown' });
     } catch (e) {
         console.error('Riwayat error:', e);
@@ -469,61 +573,38 @@ bot.onText(/\/riwayat/, async (msg) => {
     }
 });
 
-// /expired
 bot.onText(/\/expired/, async (msg) => {
     const chatId = msg.chat.id;
     const tg = '@' + (msg.from.username || msg.from.id);
 
     try {
         bot.sendChatAction(chatId, 'typing');
-
-        const snap = await db.collection('accounts')
-            .where('telegram', '==', tg)
-            .get();
-
-        if (snap.empty) {
-            return bot.sendMessage(chatId, '📭 Belum ada akun');
-        }
+        const snap = await db.collection('accounts').where('telegram', '==', tg).get();
+        if (snap.empty) return bot.sendMessage(chatId, '📭 Belum ada akun');
 
         let t = `⏰ *Masa Aktif Akun*\n━━━━━━━━━━━━━━━━━━\n\n`;
-
         snap.forEach((d, i) => {
             const x = d.data();
             let exp = '♾️ Permanent';
-
             if (x.expiresAt) {
                 const dt = x.expiresAt.toDate();
                 const diff = Math.ceil((dt - new Date()) / 86400000);
                 const status = diff > 0 ? `✅ ${diff} hari lagi` : `❌ EXPIRED`;
                 exp = `${dt.toLocaleDateString('id-ID')} (${status})`;
             }
-
-            t += `*${i + 1}. \`${x.username}\`*\n`;
-            t += `   Role: ${x.role}\n`;
-            t += `   ${exp}\n\n`;
+            t += `*${i + 1}. \`${x.username}\`*\n   Role: ${x.role}\n   ${exp}\n\n`;
         });
-
         bot.sendMessage(chatId, t, { parse_mode: 'Markdown' });
     } catch (e) {
-        console.error('Expired error:', e);
         bot.sendMessage(chatId, '❌ Error: ' + e.message);
     }
 });
 
-// /leaderboard
 bot.onText(/\/leaderboard/, async (msg) => {
-    const chatId = msg.chat.id;
-
     try {
-        bot.sendChatAction(chatId, 'typing');
-
-        const snap = await db.collection('transactions')
-            .where('status', '==', 'paid')
-            .get();
-
-        if (snap.empty) {
-            return bot.sendMessage(chatId, '📭 Belum ada transaksi');
-        }
+        bot.sendChatAction(msg.chat.id, 'typing');
+        const snap = await db.collection('transactions').where('status', '==', 'paid').get();
+        if (snap.empty) return bot.sendMessage(msg.chat.id, '📭 Belum ada transaksi');
 
         const map = {};
         snap.forEach(d => {
@@ -532,39 +613,29 @@ bot.onText(/\/leaderboard/, async (msg) => {
             map[k] = (map[k] || 0) + Number(x.total || 0);
         });
 
-        const arr = Object.entries(map)
-            .sort((a, b) => b[1] - a[1])
-            .slice(0, 10);
-
+        const arr = Object.entries(map).sort((a, b) => b[1] - a[1]).slice(0, 10);
         let t = `🏆 *Top Spender*\n━━━━━━━━━━━━━━━━━━\n\n`;
-
         arr.forEach(([u, v], i) => {
             const m = i === 0 ? '🥇' : i === 1 ? '🥈' : i === 2 ? '🥉' : `${i + 1}.`;
             t += `${m} ${u}\n    💰 ${rupiah(v)}\n\n`;
         });
-
-        bot.sendMessage(chatId, t, { parse_mode: 'Markdown' });
+        bot.sendMessage(msg.chat.id, t, { parse_mode: 'Markdown' });
     } catch (e) {
-        console.error('Leaderboard error:', e);
-        bot.sendMessage(chatId, '❌ Error: ' + e.message);
+        bot.sendMessage(msg.chat.id, '❌ Error: ' + e.message);
     }
 });
 
-// /support
 bot.onText(/\/support/, (msg) => {
     bot.sendMessage(msg.chat.id,
         `📞 *Hubungi Support*\n\n` +
         `👑 Owner: Jaden Hiram\n` +
         `📧 Email: vexoraofficial@gmail.com\n` +
         `📱 Telegram: +62 859-2364-8453\n` +
-        `💬 WhatsApp: +62 882-0092-39791\n\n` +
-        `⏰ Respon: 1-24 jam\n` +
-        `🌐 Partner: Vexora, Jamzz Str, Zeyron Official`,
+        `💬 WhatsApp: +62 882-0092-39791`,
         { parse_mode: 'Markdown' }
     );
 });
 
-// /download
 bot.onText(/\/download/, (msg) => {
     bot.sendMessage(msg.chat.id,
         `📱 *Download APK Zeyron Command*\n\n` +
@@ -575,32 +646,61 @@ bot.onText(/\/download/, (msg) => {
 });
 
 /* ==========================================================
-   BOT COMMANDS — ADMIN
+   BOT COMMANDS — ADMIN (Owner only)
    ========================================================== */
 
-// /generate <type> [days]
-bot.onText(/\/generate\s+(\S+)(?:\s+(\d+))?/, async (msg, match) => {
+/* ---------- /generate — DENGAN CUSTOM USERNAME/PASSWORD ---------- */
+bot.onText(/\/generate\s+(\S+)(?:\s+(\S+))?(?:\s+(\S+))?(?:\s+(\S+))?/, async (msg, match) => {
     if (msg.from.id !== CONFIG.OWNER_ID) {
         return bot.sendMessage(msg.chat.id, '❌ Hanya Developer');
     }
 
     const typeId = match[1].toLowerCase();
-    const days = match[2] || null;
-    const type = ACCOUNT_TYPES[typeId];
+    const arg2 = match[2] || null;   // bisa jadi hari ATAU username
+    const arg3 = match[3] || null;   // password atau hari
+    const arg4 = match[4] || null;   // password
 
+    const type = ACCOUNT_TYPES[typeId];
     if (!type) {
         return bot.sendMessage(msg.chat.id,
-            `❌ Tipe \`${typeId}\` tidak valid\n\nGunakan /roles untuk lihat daftar`,
+            `❌ Tipe \`${typeId}\` tidak valid\n\nGunakan /roles`,
             { parse_mode: 'Markdown' }
         );
     }
 
+    // Parse argumen: kalau butuh durasi, arg2 = hari
+    let days = null;
+    let customUser = null;
+    let customPass = null;
+
     if (type.needsDuration) {
+        // Format: /generate member <hari> [user] [pass]
+        days = arg2;
+        customUser = arg3;
+        customPass = arg4;
+
         const d = parseInt(days);
         if (isNaN(d) || d < type.minDays || d > type.maxDays) {
             return bot.sendMessage(msg.chat.id,
-                `⚠️ Untuk *${type.name}*, wajib isi durasi ${type.minDays}-${type.maxDays} hari\n\n` +
-                `Contoh: \`/generate ${typeId} 7\``,
+                `⚠️ *${type.name}* wajib isi durasi ${type.minDays}-${type.maxDays} hari\n\n` +
+                `Format:\n` +
+                `• \`/generate ${typeId} 7\` (random)\n` +
+                `• \`/generate ${typeId} 7 userku passku\` (custom)`,
+                { parse_mode: 'Markdown' }
+            );
+        }
+    } else {
+        // Format: /generate permanent [user] [pass]
+        customUser = arg2;
+        customPass = arg3;
+
+        // Kalau arg2 ternyata angka dan arg3 bukan, kemungkinan user pakai format lama
+        if (arg2 && !isNaN(parseInt(arg2)) && !arg3) {
+            return bot.sendMessage(msg.chat.id,
+                `⚠️ *${type.name}* tidak butuh durasi\n\n` +
+                `Format:\n` +
+                `• \`/generate ${typeId}\` (random)\n` +
+                `• \`/generate ${typeId} userku passku\` (custom)`,
                 { parse_mode: 'Markdown' }
             );
         }
@@ -608,35 +708,18 @@ bot.onText(/\/generate\s+(\S+)(?:\s+(\d+))?/, async (msg, match) => {
 
     try {
         bot.sendChatAction(msg.chat.id, 'typing');
-        const acc = await generateAccount(typeId, days, 'owner_manual');
+        const acc = await generateAccount(typeId, days, 'owner_manual', customUser, customPass);
 
-        const expText = acc.expiresAt
-            ? acc.expiresAt.toDate().toLocaleString('id-ID')
-            : '♾️ Permanent';
-
-        const durText = acc.days ? `${acc.days} hari` : (acc.permanent ? 'Permanent' : '-');
-
-        bot.sendMessage(msg.chat.id,
-            `✅ *AKUN DI-GENERATE*\n\n` +
-            `📦 Tipe: *${acc.typeName}*\n` +
-            `🎭 Role Login: \`${acc.role}\`\n` +
-            `⏳ Durasi: ${durText}\n` +
-            `📅 Expired: ${expText}\n` +
-            `━━━━━━━━━━━━━━━━━━\n` +
-            `👤 Username: \`${acc.username}\`\n` +
-            `🔑 Password: \`${acc.password}\`\n` +
-            `━━━━━━━━━━━━━━━━━━\n` +
-            `💾 Pool: available ✅\n` +
-            `🔐 Login home.html: SIAP ✅`,
-            { parse_mode: 'Markdown' }
-        );
+        await sendAccountMessage(msg.chat.id, acc, {
+            footer: acc.isCustom ? '🎨 Akun custom berhasil dibuat!' : undefined
+        });
     } catch (e) {
         console.error('Generate error:', e);
-        bot.sendMessage(msg.chat.id, `❌ Error: ${e.message}`);
+        bot.sendMessage(msg.chat.id, `❌ *Gagal generate*\n\n${e.message}`, { parse_mode: 'Markdown' });
     }
 });
 
-// /bulk <count> <type> [days]
+/* ---------- /bulk — massal (selalu random) ---------- */
 bot.onText(/\/bulk\s+(\d+)\s+(\S+)(?:\s+(\d+))?/, async (msg, match) => {
     if (msg.from.id !== CONFIG.OWNER_ID) return;
 
@@ -699,16 +782,23 @@ bot.onText(/\/bulk\s+(\d+)\s+(\S+)(?:\s+(\d+))?/, async (msg, match) => {
                 parse_mode: 'Markdown'
             });
         } else {
+            // CSV file
             const csv = accounts.map(a =>
                 `${a.username}|${a.password}|${a.type}|${days || 'permanent'}`
             ).join('\n');
-            const buffer = Buffer.from(csv, 'utf8');
-            await bot.sendDocument(msg.chat.id, buffer, {
-                caption: `✅ ${count} akun ${type.name} (${days ? days + ' hari' : 'permanent'})`
-            }, {
-                filename: `accounts_${typeId}_${Date.now()}.txt`,
-                contentType: 'text/plain'
-            });
+
+            // Kirim sebagai text file
+            await bot.sendDocument(msg.chat.id,
+                Buffer.from(csv, 'utf8'),
+                {
+                    caption: `✅ ${count} akun ${type.name} (${days ? days + ' hari' : 'permanent'})\n🔐 Login di index.html`
+                },
+                {
+                    filename: `accounts_${typeId}_${Date.now()}.txt`,
+                    contentType: 'text/plain'
+                }
+            );
+
             await bot.editMessageText(
                 `✅ *${count} akun* berhasil dibuat & dikirim file`,
                 { chat_id: msg.chat.id, message_id: statusMsg.message_id, parse_mode: 'Markdown' }
@@ -720,14 +810,12 @@ bot.onText(/\/bulk\s+(\d+)\s+(\S+)(?:\s+(\d+))?/, async (msg, match) => {
     }
 });
 
-// /stock
+/* ---------- /stock ---------- */
 bot.onText(/\/stock/, async (msg) => {
     if (msg.from.id !== CONFIG.OWNER_ID) return;
-
     try {
         bot.sendChatAction(msg.chat.id, 'typing');
         const stock = await getStock();
-
         let t = `📦 *STOK AKUN*\n━━━━━━━━━━━━━━━━━━\n\n`;
         let total = 0;
 
@@ -738,7 +826,6 @@ bot.onText(/\/stock/, async (msg) => {
             t += `    Tersedia: *${data.available}*\n\n`;
             total += data.available;
         }
-
         t += `━━━━━━━━━━━━━━━━━━\n📊 Total: *${total} akun*`;
         bot.sendMessage(msg.chat.id, t, { parse_mode: 'Markdown' });
     } catch (e) {
@@ -746,21 +833,17 @@ bot.onText(/\/stock/, async (msg) => {
     }
 });
 
-// /accounts [type]
+/* ---------- /accounts [type] ---------- */
 bot.onText(/\/accounts(?:\s+(\S+))?/, async (msg, match) => {
     if (msg.from.id !== CONFIG.OWNER_ID) return;
-
     const typeId = match[1]?.toLowerCase();
 
     try {
         bot.sendChatAction(msg.chat.id, 'typing');
         let q = db.collection('account_pool');
-        if (typeId && ACCOUNT_TYPES[typeId]) {
-            q = q.where('type', '==', typeId);
-        }
+        if (typeId && ACCOUNT_TYPES[typeId]) q = q.where('type', '==', typeId);
 
         const snap = await q.orderBy('generatedAt', 'desc').limit(30).get();
-
         if (snap.empty) return bot.sendMessage(msg.chat.id, '📭 Pool kosong');
 
         let t = `📋 *Akun di Pool*`;
@@ -772,7 +855,6 @@ bot.onText(/\/accounts(?:\s+(\S+))?/, async (msg, match) => {
             const icon = x.status === 'available' ? '🟢' : '🔴';
             t += `${icon} \`${x.username}\` — ${x.typeName}\n`;
         });
-
         t += `\n_Total: ${snap.size}_`;
         bot.sendMessage(msg.chat.id, t, { parse_mode: 'Markdown' });
     } catch (e) {
@@ -780,16 +862,298 @@ bot.onText(/\/accounts(?:\s+(\S+))?/, async (msg, match) => {
     }
 });
 
-// /deleteaccount <username>
+/* ---------- 🆕 /checkuser ---------- */
+bot.onText(/\/checkuser\s+(\S+)/, async (msg, match) => {
+    if (msg.from.id !== CONFIG.OWNER_ID) return;
+    const username = match[1];
+
+    try {
+        bot.sendChatAction(msg.chat.id, 'typing');
+
+        const ref = db.collection('users').doc(username);
+        const snap = await ref.get();
+
+        if (!snap.exists) {
+            // Coba query
+            const q = await db.collection('users').where('username', '==', username).limit(1).get();
+            if (q.empty) {
+                return bot.sendMessage(msg.chat.id,
+                    `❌ *Akun TIDAK ADA*\n\n\`${username}\` tidak ditemukan di collection users.\n\n` +
+                    `Kemungkinan:\n` +
+                    `• Bot belum pernah generate\n` +
+                    `• Sudah dihapus\n` +
+                    `• Firebase project beda`,
+                    { parse_mode: 'Markdown' }
+                );
+            }
+        }
+
+        const data = (snap.exists ? snap.data() : (await db.collection('users').where('username', '==', username).limit(1).get()).docs[0].data());
+
+        // Cek field yang dibutuhkan index.html & home.html
+        const checks = {
+            username: !!data.username,
+            password: !!data.password,
+            role: !!data.role,
+            expires_atau_expired: !!(data.expires || data.expired || data.expires === 'never'),
+            wallet_atau_balance: !!(typeof data.wallet === 'number' || typeof data.balance === 'number'),
+            banned_field: typeof data.banned === 'boolean'
+        };
+
+        const allOk = Object.values(checks).every(v => v);
+        const expText = data.expires === 'never' ? '♾️ Permanent' : (data.expires || data.expired || '-');
+
+        let t = `${allOk ? '✅' : '⚠️'} *STATUS AKUN*\n━━━━━━━━━━━━━━━━━━\n\n`;
+        t += `👤 \`${data.username}\`\n`;
+        t += `🎭 Role: \`${data.role}\`\n`;
+        t += `📅 Expires: ${expText}\n`;
+        t += `💰 Wallet: ${rupiah(data.wallet || 0)}\n`;
+        t += `💵 Balance: ${rupiah(data.balance || 0)}\n`;
+        t += `🚫 Banned: ${data.banned ? 'YA' : 'Tidak'}\n`;
+        t += `\n*Field check:*\n`;
+        for (const [k, v] of Object.entries(checks)) {
+            t += `${v ? '✅' : '❌'} ${k}\n`;
+        }
+        t += `\n${allOk ? '🔐 *SIAP LOGIN* di index.html' : '⚠️ Jalankan /fixuser ' + username}`;
+
+        bot.sendMessage(msg.chat.id, t, { parse_mode: 'Markdown' });
+    } catch (e) {
+        bot.sendMessage(msg.chat.id, '❌ ' + e.message);
+    }
+});
+
+/* ---------- 🆕 /testlogin ---------- */
+bot.onText(/\/testlogin\s+(\S+)\s+(\S+)/, async (msg, match) => {
+    if (msg.from.id !== CONFIG.OWNER_ID) return;
+    const [, username, password] = match;
+
+    try {
+        bot.sendChatAction(msg.chat.id, 'typing');
+
+        const ref = db.collection('users').doc(username);
+        const snap = await ref.get();
+
+        if (!snap.exists) {
+            return bot.sendMessage(msg.chat.id, `❌ User \`${username}\` tidak ditemukan`, { parse_mode: 'Markdown' });
+        }
+
+        const data = snap.data();
+
+        if (data.password !== password) {
+            return bot.sendMessage(msg.chat.id, `❌ Password salah\n\nTersimpan: \`${data.password}\`\nInput: \`${password}\``, { parse_mode: 'Markdown' });
+        }
+
+        if (data.banned === true) {
+            return bot.sendMessage(msg.chat.id, `🚫 Akun di-BANNED: ${data.banReason || '-'}`, { parse_mode: 'Markdown' });
+        }
+
+        // Cek expired
+        const exp = data.expires || data.expired;
+        let expStatus = '✅ Lifetime';
+        if (exp && exp !== 'never') {
+            const dt = new Date(exp);
+            if (dt < new Date()) {
+                expStatus = '❌ EXPIRED';
+                return bot.sendMessage(msg.chat.id, `⏰ Akun *expired* pada ${exp}`, { parse_mode: 'Markdown' });
+            }
+            expStatus = `✅ Aktif s/d ${exp}`;
+        }
+
+        bot.sendMessage(msg.chat.id,
+            `✅ *LOGIN SIMULASI BERHASIL*\n\n` +
+            `👤 \`${data.username}\`\n` +
+            `🔑 \`${data.password}\`\n` +
+            `🎭 Role: \`${data.role}\`\n` +
+            `📅 ${expStatus}\n` +
+            `💰 Wallet: ${rupiah(data.wallet || 0)}\n\n` +
+            `🔐 Akun ini *BISA LOGIN* di index.html ✅`,
+            { parse_mode: 'Markdown' }
+        );
+    } catch (e) {
+        bot.sendMessage(msg.chat.id, '❌ ' + e.message);
+    }
+});
+
+/* ---------- 🆕 /fixuser ---------- */
+bot.onText(/\/fixuser\s+(\S+)/, async (msg, match) => {
+    if (msg.from.id !== CONFIG.OWNER_ID) return;
+    const username = match[1];
+
+    try {
+        bot.sendChatAction(msg.chat.id, 'typing');
+        const ref = db.collection('users').doc(username);
+        const snap = await ref.get();
+
+        if (!snap.exists) {
+            return bot.sendMessage(msg.chat.id, `❌ \`${username}\` tidak ditemukan`, { parse_mode: 'Markdown' });
+        }
+
+        const data = snap.data();
+        const patch = {};
+
+        // Fix dual fields
+        if (typeof data.wallet === 'number' && typeof data.balance !== 'number') {
+            patch.balance = data.wallet;
+        }
+        if (typeof data.balance === 'number' && typeof data.wallet !== 'number') {
+            patch.wallet = data.balance;
+        }
+        if (data.expires && !('expired' in data)) {
+            patch.expired = data.expires === 'never' ? null : data.expires;
+        }
+        if (data.expired !== undefined && !data.expires) {
+            patch.expires = data.expired || 'never';
+        }
+        if (!data.createdAt && data.joinedAt) patch.createdAt = data.joinedAt;
+        if (!data.joinedAt && data.createdAt) patch.joinedAt = data.createdAt;
+        if (typeof data.banned !== 'boolean') patch.banned = false;
+        if (!data.banReason) patch.banReason = '';
+        if (!data.avatar) patch.avatar = '';
+        if (!Array.isArray(data.themes)) patch.themes = [];
+        if (!Array.isArray(data.achievements)) patch.achievements = [];
+        if (!Array.isArray(data.additionalRoles)) patch.additionalRoles = [];
+        if (typeof data.exp !== 'number') patch.exp = 0;
+        patch.loginReady = true;
+
+        if (Object.keys(patch).length === 0) {
+            return bot.sendMessage(msg.chat.id, `✅ \`${username}\` sudah OK, tidak perlu fix`, { parse_mode: 'Markdown' });
+        }
+
+        await ref.update(patch);
+
+        let t = `✅ *FIXED:* \`${username}\`\n\n*Field ditambahkan/diperbaiki:*\n`;
+        for (const k of Object.keys(patch)) t += `• \`${k}\`\n`;
+        t += `\n🔐 Sekarang akun ini *BISA LOGIN* di index.html`;
+
+        bot.sendMessage(msg.chat.id, t, { parse_mode: 'Markdown' });
+    } catch (e) {
+        bot.sendMessage(msg.chat.id, '❌ ' + e.message);
+    }
+});
+
+/* ---------- 🆕 /syncusers — Fix semua akun lama ---------- */
+bot.onText(/\/syncusers/, async (msg) => {
+    if (msg.from.id !== CONFIG.OWNER_ID) return;
+
+    try {
+        bot.sendChatAction(msg.chat.id, 'typing');
+        const statusMsg = await bot.sendMessage(msg.chat.id, '⏳ Scanning semua user...');
+
+        const snap = await db.collection('users').get();
+        let fixed = 0, ok = 0, failed = 0;
+        const fixes = [];
+
+        for (const doc of snap.docs) {
+            try {
+                const data = doc.data();
+                const patch = {};
+
+                if (typeof data.wallet === 'number' && typeof data.balance !== 'number') patch.balance = data.wallet;
+                if (typeof data.balance === 'number' && typeof data.wallet !== 'number') patch.wallet = data.balance;
+                if (data.expires && !('expired' in data)) patch.expired = data.expires === 'never' ? null : data.expires;
+                if (data.expired !== undefined && !data.expires) patch.expires = data.expired || 'never';
+                if (!data.createdAt && data.joinedAt) patch.createdAt = data.joinedAt;
+                if (!data.joinedAt && data.createdAt) patch.joinedAt = data.createdAt;
+                if (typeof data.banned !== 'boolean') patch.banned = false;
+                if (!data.banReason) patch.banReason = '';
+                if (!data.avatar) patch.avatar = '';
+                if (!Array.isArray(data.themes)) patch.themes = [];
+                if (!Array.isArray(data.achievements)) patch.achievements = [];
+                if (!Array.isArray(data.additionalRoles)) patch.additionalRoles = [];
+                if (typeof data.exp !== 'number') patch.exp = 0;
+
+                if (Object.keys(patch).length === 0) { ok++; continue; }
+
+                patch.loginReady = true;
+                await doc.ref.update(patch);
+                fixed++;
+                if (fixes.length < 5) fixes.push(doc.id);
+            } catch (e) {
+                failed++;
+            }
+        }
+
+        let t = `✅ *SYNC COMPLETE*\n\n`;
+        t += `📊 Total user: *${snap.size}*\n`;
+        t += `✅ Sudah OK: *${ok}*\n`;
+        t += `🔧 Diperbaiki: *${fixed}*\n`;
+        t += `❌ Gagal: *${failed}*\n\n`;
+        if (fixes.length) {
+            t += `*Contoh yang diperbaiki:*\n`;
+            fixes.forEach(f => { t += `• \`${f}\`\n`; });
+        }
+        t += `\n💡 Semua user sekarang *BISA LOGIN* di index.html`;
+
+        await bot.editMessageText(t, {
+            chat_id: msg.chat.id,
+            message_id: statusMsg.message_id,
+            parse_mode: 'Markdown'
+        });
+    } catch (e) {
+        console.error('syncusers error:', e);
+        bot.sendMessage(msg.chat.id, '❌ ' + e.message);
+    }
+});
+
+/* ---------- 🆕 /diag — Diagnostik Firebase ---------- */
+bot.onText(/\/diag/, async (msg) => {
+    if (msg.from.id !== CONFIG.OWNER_ID) return;
+
+    try {
+        bot.sendChatAction(msg.chat.id, 'typing');
+
+        // Test 1: Read users count
+        const usersSnap = await db.collection('users').limit(1).get();
+        const usersCount = (await db.collection('users').get()).size;
+
+        // Test 2: Read pool count
+        const poolCount = (await db.collection('account_pool').get()).size;
+
+        // Test 3: Check bot identity
+        const botInfo = await bot.getMe();
+
+        let t = `🔍 *DIAGNOSTIK SISTEM*\n━━━━━━━━━━━━━━━━━━\n\n`;
+        t += `*Firebase:*\n`;
+        t += `✅ Connected\n`;
+        t += `👥 Users: *${usersCount}*\n`;
+        t += `📦 Pool: *${poolCount}*\n\n`;
+        t += `*Bot:*\n`;
+        t += `✅ @${botInfo.username}\n`;
+        t += `🆔 ${botInfo.id}\n\n`;
+        t += `*Owner:*\n`;
+        t += `🆔 \`${CONFIG.OWNER_ID}\`\n`;
+        t += `✅ Verified: ${msg.from.id === CONFIG.OWNER_ID ? 'YES' : 'NO'}\n\n`;
+        t += `*Sample user (first):*\n`;
+        if (usersSnap.size > 0) {
+            const sample = usersSnap.docs[0];
+            const d = sample.data();
+            t += `👤 \`${sample.id}\`\n`;
+            t += `🎭 Role: ${d.role}\n`;
+            t += `🔑 Has password: ${!!d.password}\n`;
+            t += `💰 Balance: ${d.balance || d.wallet || 0}\n`;
+            t += `📅 Expires: ${d.expires || d.expired || '-'}\n`;
+            t += `🚫 Banned: ${d.banned ? 'YES' : 'NO'}\n`;
+        } else {
+            t += `_Belum ada user_\n`;
+        }
+
+        t += `\n*Waktu:* ${new Date().toLocaleString('id-ID')}`;
+
+        bot.sendMessage(msg.chat.id, t, { parse_mode: 'Markdown' });
+    } catch (e) {
+        console.error('diag error:', e);
+        bot.sendMessage(msg.chat.id, '❌ Diag error: ' + e.message);
+    }
+});
+
+/* ---------- /deleteaccount ---------- */
 bot.onText(/\/deleteaccount\s+(\S+)/, async (msg, match) => {
     if (msg.from.id !== CONFIG.OWNER_ID) return;
     const username = match[1];
 
     try {
-        let deletedPool = false;
-        let deletedUser = false;
+        let deletedPool = false, deletedUser = false;
 
-        // Hapus dari pool
         const poolSnap = await db.collection('account_pool')
             .where('username', '==', username).limit(1).get();
         if (!poolSnap.empty) {
@@ -797,7 +1161,6 @@ bot.onText(/\/deleteaccount\s+(\S+)/, async (msg, match) => {
             deletedPool = true;
         }
 
-        // Hapus dari users
         const userRef = db.collection('users').doc(username);
         const userSnap = await userRef.get();
         if (userSnap.exists) {
@@ -810,9 +1173,7 @@ bot.onText(/\/deleteaccount\s+(\S+)/, async (msg, match) => {
         }
 
         bot.sendMessage(msg.chat.id,
-            `✅ \`${username}\` dihapus\n\n` +
-            `Pool: ${deletedPool ? '✅' : '❌'}\n` +
-            `Users: ${deletedUser ? '✅' : '❌'}`,
+            `✅ \`${username}\` dihapus\n\nPool: ${deletedPool ? '✅' : '❌'}\nUsers: ${deletedUser ? '✅' : '❌'}`,
             { parse_mode: 'Markdown' }
         );
     } catch (e) {
@@ -820,7 +1181,7 @@ bot.onText(/\/deleteaccount\s+(\S+)/, async (msg, match) => {
     }
 });
 
-// /clearused
+/* ---------- /clearused ---------- */
 bot.onText(/\/clearused/, async (msg) => {
     if (msg.from.id !== CONFIG.OWNER_ID) return;
 
@@ -838,7 +1199,7 @@ bot.onText(/\/clearused/, async (msg) => {
     }
 });
 
-// /migratepool — Migrate akun pool lama ke users
+/* ---------- /migratepool ---------- */
 bot.onText(/\/migratepool/, async (msg) => {
     if (msg.from.id !== CONFIG.OWNER_ID) return;
 
@@ -858,11 +1219,10 @@ bot.onText(/\/migratepool/, async (msg) => {
             const userSnap = await userRef.get();
             if (userSnap.exists) { skipped++; continue; }
 
-            let role = 'member';
+            let role = 'premium';
             if (data.type === 'owner') role = 'owner';
             else if (data.type === 'admin') role = 'admin';
             else if (data.type === 'reseller') role = 'reseller';
-            else if (data.type === 'permanent' || data.type === 'style') role = 'premium';
 
             let expires = 'never';
             if (!data.permanent && data.expiresAt) {
@@ -871,26 +1231,18 @@ bot.onText(/\/migratepool/, async (msg) => {
             }
 
             try {
-                await userRef.set({
+                const userData = buildUserData({
                     username,
                     password: data.password,
                     role,
                     expires,
-                    wallet: 0,
-                    banned: false,
-                    banReason: '',
-                    createdAt: new Date().toISOString(),
-                    type: data.type,
+                    typeId: data.type,
                     typeName: data.typeName,
                     days: data.days || null,
                     generatedBy: data.generatedBy || 'migration',
-                    source: 'migrated_from_pool',
-                    avatar: './assets/avatar-default.png',
-                    themes: [],
-                    achievements: [],
-                    exp: 0,
-                    additionalRoles: []
+                    source: 'migrated_from_pool'
                 });
+                await userRef.set(userData);
                 migrated++;
             } catch (e) {
                 console.error(`Failed migrate ${username}:`, e);
@@ -900,11 +1252,11 @@ bot.onText(/\/migratepool/, async (msg) => {
 
         await bot.editMessageText(
             `✅ *MIGRASI SELESAI*\n\n` +
-            `📦 Total di pool: ${snap.size}\n` +
+            `📦 Total pool: ${snap.size}\n` +
             `✅ Migrated: *${migrated}*\n` +
-            `⏭️ Skipped (sudah ada): *${skipped}*\n` +
+            `⏭️ Skipped: *${skipped}*\n` +
             `❌ Failed: *${failed}*\n\n` +
-            `Semua akun yang di-migrate sekarang *BISA LOGIN* di home.html ✅`,
+            `Semua akun sekarang *BISA LOGIN* di index.html ✅`,
             { chat_id: msg.chat.id, message_id: statusMsg.message_id, parse_mode: 'Markdown' }
         );
     } catch (e) {
@@ -913,7 +1265,7 @@ bot.onText(/\/migratepool/, async (msg) => {
     }
 });
 
-// /stats
+/* ---------- /stats ---------- */
 bot.onText(/\/stats/, async (msg) => {
     if (msg.from.id !== CONFIG.OWNER_ID) return;
 
@@ -933,14 +1285,14 @@ bot.onText(/\/stats/, async (msg) => {
         });
 
         bot.sendMessage(msg.chat.id,
-            `📊 *STATISTIK BOT*\n━━━━━━━━━━━━━━━━━━\n\n` +
+            `📊 *STATISTIK*\n━━━━━━━━━━━━━━━━━━\n\n` +
             `💰 Revenue: *${rupiah(rev)}*\n` +
             `✅ Lunas: *${paid}*\n` +
             `⏳ Pending: *${pending}*\n` +
-            `📦 Akun terjual: *${aSnap.size}*\n` +
-            `🎁 Akun di pool: *${pSnap.size}*\n` +
-            `👥 Total Users: *${uSnap.size}*\n` +
-            `📈 Total Transaksi: *${tSnap.size}*\n\n` +
+            `📦 Terjual: *${aSnap.size}*\n` +
+            `🎁 Pool: *${pSnap.size}*\n` +
+            `👥 Users: *${uSnap.size}*\n` +
+            `📈 Transaksi: *${tSnap.size}*\n\n` +
             `🕐 ${new Date().toLocaleString('id-ID')}`,
             { parse_mode: 'Markdown' }
         );
@@ -949,7 +1301,7 @@ bot.onText(/\/stats/, async (msg) => {
     }
 });
 
-// /broadcast <pesan>
+/* ---------- /broadcast ---------- */
 bot.onText(/\/broadcast (.+)/, async (msg, match) => {
     if (msg.from.id !== CONFIG.OWNER_ID) return;
 
@@ -963,10 +1315,8 @@ bot.onText(/\/broadcast (.+)/, async (msg, match) => {
         for (const doc of snap.docs) {
             const u = doc.data();
             if (!u.telegram) continue;
-
             const chatId = String(u.telegram).replace(/[^0-9]/g, '') ||
                            String(u.telegram).replace('@', '');
-
             try {
                 await bot.sendMessage(chatId, `📢 *PENGUMUMAN*\n\n${pesan}`, { parse_mode: 'Markdown' });
                 sent++;
@@ -975,7 +1325,6 @@ bot.onText(/\/broadcast (.+)/, async (msg, match) => {
                 failed++;
             }
         }
-
         bot.sendMessage(msg.chat.id, `✅ Broadcast selesai\n\nTerkirim: ${sent}\nGagal: ${failed}`);
     } catch (e) {
         bot.sendMessage(msg.chat.id, '❌ ' + e.message);
@@ -989,62 +1338,36 @@ const app = express();
 app.use(cors());
 app.use(express.json({ limit: '5mb' }));
 
-// Request logger
 app.use((req, res, next) => {
     console.log(`[${new Date().toISOString()}] ${req.method} ${req.path}`);
     next();
 });
 
-// Health check
 app.get('/', (req, res) => {
     res.json({
         ok: true,
         service: 'Zeyron Command Bot',
-        version: '6.0.0',
-        features: ['order', 'payment', 'account-generator', 'pool-system', 'multi-role'],
-        endpoints: [
-            'POST /order',
-            'POST /payment/create',
-            'POST /payment/webhook',
-            'POST /dev/login',
-            'POST /dev/change-password',
-            'POST /dev/discount',
-            'POST /dev/settings',
-            'POST /api/generate'
-        ],
+        version: '7.1.0',
+        features: ['order', 'payment', 'account-generator', 'custom-user', 'pool-system', 'multi-role'],
         time: new Date().toISOString()
     });
 });
 
-/* ==================== ORDER (Auto-deliver) ==================== */
+/* ==================== ORDER ==================== */
 app.post('/order', async (req, res) => {
     try {
-        const {
-            invoice,
-            role,
-            roleId,
-            duration,
-            total,
-            telegram,
-            days
-        } = req.body;
+        const { invoice, role, roleId, duration, total, telegram, days } = req.body;
 
         if (!invoice || !telegram || !roleId) {
             return res.status(400).json({ ok: false, error: 'Missing fields' });
         }
 
-        // Cek duplikat
         const existing = await db.collection('accounts')
             .where('invoice', '==', invoice).limit(1).get();
+        if (!existing.empty) return res.json({ ok: true, message: 'Already delivered' });
 
-        if (!existing.empty) {
-            return res.json({ ok: true, message: 'Already delivered' });
-        }
-
-        // Claim akun dari pool
         const acc = await claimAccount(roleId, telegram, invoice);
 
-        // Simpan ke collection accounts
         await db.collection('accounts').add({
             invoice,
             username: acc.username,
@@ -1057,7 +1380,6 @@ app.post('/order', async (req, res) => {
             createdAt: FieldValue.serverTimestamp()
         });
 
-        // Kirim ke Telegram user
         const tgId = String(telegram).replace(/[^0-9]/g, '') ||
                      String(telegram).replace('@', '');
 
@@ -1086,15 +1408,12 @@ app.post('/order', async (req, res) => {
             delivered = true;
         } catch (e) {
             await db.collection('pending_deliveries').add({
-                telegram: tgId,
-                message: userMsg,
-                invoice,
+                telegram: tgId, message: userMsg, invoice,
                 reason: e.message,
                 createdAt: FieldValue.serverTimestamp()
             });
         }
 
-        // Notif admin
         if (CONFIG.ADMIN_CHAT) {
             bot.sendMessage(CONFIG.ADMIN_CHAT,
                 `💰 *NEW ORDER*\n\n` +
@@ -1108,13 +1427,7 @@ app.post('/order', async (req, res) => {
             ).catch(() => {});
         }
 
-        res.json({
-            ok: true,
-            invoice,
-            username: acc.username,
-            fromPool: acc.fromPool,
-            delivered
-        });
+        res.json({ ok: true, invoice, username: acc.username, fromPool: acc.fromPool, delivered });
     } catch (e) {
         console.error('Order error:', e);
         res.status(500).json({ ok: false, error: e.message });
@@ -1125,15 +1438,12 @@ app.post('/order', async (req, res) => {
 app.post('/payment/create', async (req, res) => {
     try {
         const { invoice, amount, customer, type, roleId, days } = req.body;
-
         if (!invoice || !amount) {
             return res.status(400).json({ ok: false, error: 'Missing fields' });
         }
 
-        let qrisUrl = '';
-        let provider = 'demo';
+        let qrisUrl = '', provider = 'demo';
 
-        // Pakasir real
         if (CONFIG.PAYMENT_PROVIDER === 'pakasir' && CONFIG.PAYMENT_API_KEY) {
             try {
                 const resp = await fetch('https://pakasir.zone.id/api/transactions', {
@@ -1154,24 +1464,20 @@ app.post('/payment/create', async (req, res) => {
             }
         }
 
-        // Fallback demo
         if (!qrisUrl) {
             const payload = `00020101021226610014ID.CO.QRIS.WWW0118${invoice}0215ID1020021949203031ID5204581253033605802ID5910ZEYRON CO6007JAKARTA61051219062070703A015402${amount}6304ABCD`;
             qrisUrl = 'https://api.qrserver.com/v1/create-qr-code/?size=400x400&bgcolor=ffffff&color=000000&data=' +
                 encodeURIComponent(payload);
         }
 
-        // Simpan ke Firestore
         await db.collection('topups').doc(invoice).set({
-            invoice,
-            username: customer,
+            invoice, username: customer,
             amount: Number(amount),
             type: type || 'topup',
             roleId: roleId || null,
             days: days || null,
             status: 'pending',
-            qrisUrl,
-            provider,
+            qrisUrl, provider,
             createdAt: FieldValue.serverTimestamp()
         });
 
@@ -1185,15 +1491,9 @@ app.post('/payment/create', async (req, res) => {
 /* ==================== PAYMENT CHECK ==================== */
 app.get('/payment/check/:invoice', async (req, res) => {
     try {
-        const { invoice } = req.params;
-
-        const topupSnap = await db.collection('topups').doc(invoice).get();
-        if (!topupSnap.exists) {
-            return res.json({ ok: true, status: 'not_found' });
-        }
-
-        const data = topupSnap.data();
-        res.json({ ok: true, status: data.status, data });
+        const snap = await db.collection('topups').doc(req.params.invoice).get();
+        if (!snap.exists) return res.json({ ok: true, status: 'not_found' });
+        res.json({ ok: true, status: snap.data().status, data: snap.data() });
     } catch (e) {
         res.status(500).json({ ok: false, error: e.message });
     }
@@ -1209,51 +1509,42 @@ app.post('/payment/webhook', async (req, res) => {
         const status = (body.status || body.payment_status || '').toLowerCase();
         const amount = body.amount || body.total || body.paid_amount;
 
-        if (!invoice) {
-            return res.status(400).json({ ok: false, error: 'No invoice' });
-        }
+        if (!invoice) return res.status(400).json({ ok: false, error: 'No invoice' });
 
         const successStatus = ['paid', 'completed', 'settlement', 'success', 'berhasil', 'lunas'];
-        if (!successStatus.includes(status)) {
-            return res.json({ ok: true, received: true });
-        }
+        if (!successStatus.includes(status)) return res.json({ ok: true, received: true });
 
         const topupRef = db.collection('topups').doc(invoice);
         const topupSnap = await topupRef.get();
-
-        if (!topupSnap.exists) {
-            return res.status(404).json({ ok: false, error: 'Invoice not found' });
-        }
+        if (!topupSnap.exists) return res.status(404).json({ ok: false, error: 'Invoice not found' });
 
         const topup = topupSnap.data();
-        if (topup.status === 'paid') {
-            return res.json({ ok: true, message: 'Already processed' });
-        }
+        if (topup.status === 'paid') return res.json({ ok: true, message: 'Already processed' });
 
-        // Update status
         await topupRef.update({
             status: 'paid',
             paidAt: FieldValue.serverTimestamp(),
             webhookData: body
         });
 
-        // Credit saldo user
         if (topup.type === 'topup' && topup.username) {
             const userRef = db.collection('users').doc(topup.username);
             const userSnap = await userRef.get();
 
             if (userSnap.exists) {
                 const user = userSnap.data();
-                const newSaldo = (user.wallet || 0) + Number(topup.amount);
+                const cur = Number(user.balance || user.wallet || 0);
+                const newSaldo = cur + Number(topup.amount);
 
+                // Update dual field
                 await userRef.update({
                     wallet: newSaldo,
+                    balance: newSaldo,
                     lastTopup: new Date().toISOString()
                 });
 
                 console.log(`✅ Topup: ${topup.username} +${rupiah(topup.amount)}`);
 
-                // Notif ke user
                 if (user.telegram) {
                     const tgId = String(user.telegram).replace(/[^0-9]/g, '') ||
                                  String(user.telegram).replace('@', '');
@@ -1261,19 +1552,17 @@ app.post('/payment/webhook', async (req, res) => {
                         `💰 *TOP-UP BERHASIL*\n\n` +
                         `💵 Nominal: *${rupiah(topup.amount)}*\n` +
                         `🧾 Invoice: \`${invoice}\`\n` +
-                        `💳 Saldo Baru: *${rupiah(newSaldo)}*\n\n` +
-                        `_Terima kasih!_`,
+                        `💳 Saldo Baru: *${rupiah(newSaldo)}*`,
                         { parse_mode: 'Markdown' }
                     ).catch(() => {});
                 }
 
-                // Notif admin
                 if (CONFIG.ADMIN_CHAT) {
                     bot.sendMessage(CONFIG.ADMIN_CHAT,
                         `💰 *TOP-UP MASUK*\n\n` +
-                        `👤 User: \`${topup.username}\`\n` +
-                        `💵 Nominal: *${rupiah(topup.amount)}*\n` +
-                        `🧾 Invoice: \`${invoice}\``,
+                        `👤 \`${topup.username}\`\n` +
+                        `💵 *${rupiah(topup.amount)}*\n` +
+                        `🧾 \`${invoice}\``,
                         { parse_mode: 'Markdown' }
                     ).catch(() => {});
                 }
@@ -1290,8 +1579,7 @@ app.post('/payment/webhook', async (req, res) => {
 /* ==================== API: GENERATE ==================== */
 app.post('/api/generate', async (req, res) => {
     try {
-        const { secret, roleId, typeId, count, duration } = req.body;
-
+        const { secret, roleId, typeId, count, duration, username, password } = req.body;
         if (secret !== CONFIG.WEBHOOK_SECRET) {
             return res.status(401).json({ ok: false, error: 'Unauthorized' });
         }
@@ -1305,7 +1593,12 @@ app.post('/api/generate', async (req, res) => {
         const accounts = [];
 
         for (let i = 0; i < n; i++) {
-            const acc = await generateAccount(tid, duration, 'api');
+            // Kalau count=1 dan ada custom, pakai custom
+            const acc = await generateAccount(
+                tid, duration, 'api',
+                (n === 1 && username) ? username : null,
+                (n === 1 && password) ? password : null
+            );
             accounts.push(acc);
         }
 
@@ -1319,29 +1612,19 @@ app.post('/api/generate', async (req, res) => {
 app.post('/dev/login', async (req, res) => {
     try {
         const { email, password } = req.body;
-        if (!email || !password) {
-            return res.status(400).json({ ok: false });
-        }
+        if (!email || !password) return res.status(400).json({ ok: false });
 
         const snap = await db.collection('developers')
             .where('email', '==', email)
             .where('password', '==', password)
-            .limit(1)
-            .get();
+            .limit(1).get();
 
-        if (snap.empty) {
-            return res.status(401).json({ ok: false, error: 'Kredensial salah' });
-        }
+        if (snap.empty) return res.status(401).json({ ok: false, error: 'Kredensial salah' });
 
         const dev = snap.docs[0].data();
-        if (dev.active === false) {
-            return res.status(401).json({ ok: false, error: 'Akun nonaktif' });
-        }
+        if (dev.active === false) return res.status(401).json({ ok: false, error: 'Akun nonaktif' });
 
-        res.json({
-            ok: true,
-            dev: { email: dev.email, name: dev.name || 'Developer' }
-        });
+        res.json({ ok: true, dev: { email: dev.email, name: dev.name || 'Developer' } });
     } catch (e) {
         res.status(500).json({ ok: false, error: e.message });
     }
@@ -1351,22 +1634,15 @@ app.post('/dev/login', async (req, res) => {
 app.post('/dev/change-password', async (req, res) => {
     try {
         const { email, oldPassword, newPassword } = req.body;
-        if (!email || !oldPassword || !newPassword) {
-            return res.status(400).json({ ok: false });
-        }
-        if (newPassword.length < 8) {
-            return res.status(400).json({ ok: false, error: 'Min 8 karakter' });
-        }
+        if (!email || !oldPassword || !newPassword) return res.status(400).json({ ok: false });
+        if (newPassword.length < 8) return res.status(400).json({ ok: false, error: 'Min 8 karakter' });
 
         const snap = await db.collection('developers')
             .where('email', '==', email)
             .where('password', '==', oldPassword)
-            .limit(1)
-            .get();
+            .limit(1).get();
 
-        if (snap.empty) {
-            return res.status(401).json({ ok: false, error: 'Password salah' });
-        }
+        if (snap.empty) return res.status(401).json({ ok: false, error: 'Password salah' });
 
         await snap.docs[0].ref.update({
             password: newPassword,
@@ -1383,16 +1659,12 @@ app.post('/dev/change-password', async (req, res) => {
 app.post('/dev/discount', async (req, res) => {
     try {
         const { email, password, roleId, amount, active } = req.body;
-
         const devSnap = await db.collection('developers')
             .where('email', '==', email)
             .where('password', '==', password)
-            .limit(1)
-            .get();
+            .limit(1).get();
 
-        if (devSnap.empty) {
-            return res.status(401).json({ ok: false, error: 'Unauthorized' });
-        }
+        if (devSnap.empty) return res.status(401).json({ ok: false, error: 'Unauthorized' });
 
         await db.collection('discounts').doc(roleId).set({
             amount: Number(amount || 0),
@@ -1411,16 +1683,12 @@ app.post('/dev/discount', async (req, res) => {
 app.post('/dev/settings', async (req, res) => {
     try {
         const { email, password, banner, siteName, apkUrl, telegramWebhook } = req.body;
-
         const devSnap = await db.collection('developers')
             .where('email', '==', email)
             .where('password', '==', password)
-            .limit(1)
-            .get();
+            .limit(1).get();
 
-        if (devSnap.empty) {
-            return res.status(401).json({ ok: false, error: 'Unauthorized' });
-        }
+        if (devSnap.empty) return res.status(401).json({ ok: false, error: 'Unauthorized' });
 
         const updates = {
             updatedAt: FieldValue.serverTimestamp(),
@@ -1432,7 +1700,6 @@ app.post('/dev/settings', async (req, res) => {
         if (telegramWebhook) updates.telegramWebhook = telegramWebhook;
 
         await db.collection('settings').doc('site').set(updates, { merge: true });
-
         res.json({ ok: true });
     } catch (e) {
         res.status(500).json({ ok: false, error: e.message });
@@ -1443,25 +1710,16 @@ app.post('/dev/settings', async (req, res) => {
 app.post('/buy/role', async (req, res) => {
     try {
         const { username, roleId, days } = req.body;
-
-        if (!username || !roleId) {
-            return res.status(400).json({ ok: false, error: 'Missing fields' });
-        }
+        if (!username || !roleId) return res.status(400).json({ ok: false, error: 'Missing fields' });
 
         const type = ACCOUNT_TYPES[roleId];
-        if (!type) {
-            return res.status(400).json({ ok: false, error: 'Role tidak valid' });
-        }
+        if (!type) return res.status(400).json({ ok: false, error: 'Role tidak valid' });
 
-        // Hitung total
-        let total = 0;
-        let duration = 'never';
+        let total = 0, duration = 'never';
 
         if (roleId === 'member') {
             const d = parseInt(days);
-            if (isNaN(d) || d < 1 || d > 10) {
-                return res.status(400).json({ ok: false, error: 'Durasi 1-10 hari' });
-            }
+            if (isNaN(d) || d < 1 || d > 10) return res.status(400).json({ ok: false, error: 'Durasi 1-10 hari' });
             total = type.pricePerDay * d;
             const expiry = new Date(Date.now() + d * 86400000);
             duration = expiry.toISOString().slice(0, 10);
@@ -1469,59 +1727,48 @@ app.post('/buy/role', async (req, res) => {
             total = type.price;
         }
 
-        // Cek user
         const userRef = db.collection('users').doc(username);
         const userSnap = await userRef.get();
-
-        if (!userSnap.exists) {
-            return res.status(404).json({ ok: false, error: 'User tidak ditemukan' });
-        }
+        if (!userSnap.exists) return res.status(404).json({ ok: false, error: 'User tidak ditemukan' });
 
         const user = userSnap.data();
-        const saldo = user.wallet || 0;
+        const saldo = Number(user.balance || user.wallet || 0);
 
         if (saldo < total) {
             return res.status(400).json({
-                ok: false,
-                error: 'Saldo tidak cukup',
-                needed: total - saldo,
-                saldo
+                ok: false, error: 'Saldo tidak cukup',
+                needed: total - saldo, saldo
             });
         }
 
-        // Cek developer
         const isDev = user.role === 'developer';
+        const expiredVal = duration === 'never' ? null : duration;
 
         if (isDev) {
-            // Developer — tetap developer, tambah additionalRoles
             const additional = user.additionalRoles || [];
-            if (!additional.includes(roleId)) {
-                additional.push(roleId);
-            }
-
+            if (!additional.includes(roleId)) additional.push(roleId);
             await userRef.update({
                 wallet: saldo - total,
+                balance: saldo - total,
                 role: 'developer',
                 additionalRoles: additional
             });
         } else {
-            // User biasa
             await userRef.update({
                 wallet: saldo - total,
+                balance: saldo - total,
                 role: type.loginRole,
-                expires: duration
+                expires: duration,
+                expired: expiredVal
             });
         }
 
-        // Log transaksi
         await db.collection('transactions').add({
             invoice: 'BUY-' + Date.now().toString(36).toUpperCase(),
-            username,
-            roleId,
+            username, roleId,
             roleName: type.name,
             days: days || null,
-            total,
-            status: 'paid',
+            total, status: 'paid',
             type: 'role_purchase',
             createdAt: FieldValue.serverTimestamp()
         });
@@ -1539,30 +1786,23 @@ app.post('/buy/role', async (req, res) => {
     }
 });
 
-/* ==================== REDEEM CODE ==================== */
+/* ==================== REDEEM BUY ==================== */
 app.post('/redeem/buy', async (req, res) => {
     try {
         const { resellerUsername, roleId, days } = req.body;
-
         const resellerRef = db.collection('users').doc(resellerUsername);
         const resellerSnap = await resellerRef.get();
 
-        if (!resellerSnap.exists) {
-            return res.status(404).json({ ok: false, error: 'User tidak ditemukan' });
-        }
+        if (!resellerSnap.exists) return res.status(404).json({ ok: false, error: 'User tidak ditemukan' });
 
         const reseller = resellerSnap.data();
         const allRoles = [reseller.role, ...(reseller.additionalRoles || [])];
         const isResellerOrUp = allRoles.some(r => ['reseller', 'admin', 'owner', 'developer'].includes(r));
 
-        if (!isResellerOrUp) {
-            return res.status(403).json({ ok: false, error: 'Hanya Reseller/Admin/Owner' });
-        }
+        if (!isResellerOrUp) return res.status(403).json({ ok: false, error: 'Hanya Reseller/Admin/Owner' });
 
         const type = ACCOUNT_TYPES[roleId];
-        if (!type) {
-            return res.status(400).json({ ok: false, error: 'Role tidak valid' });
-        }
+        if (!type) return res.status(400).json({ ok: false, error: 'Role tidak valid' });
 
         let basePrice = 0;
         if (roleId === 'member') {
@@ -1571,18 +1811,15 @@ app.post('/redeem/buy', async (req, res) => {
         } else {
             basePrice = type.price;
         }
-        const price = Math.round(basePrice * 0.5); // Diskon 50%
+        const price = Math.round(basePrice * 0.5);
 
-        const saldo = reseller.wallet || 0;
-        if (saldo < price) {
-            return res.status(400).json({ ok: false, error: 'Saldo tidak cukup', needed: price });
-        }
+        const saldo = Number(reseller.balance || reseller.wallet || 0);
+        if (saldo < price) return res.status(400).json({ ok: false, error: 'Saldo tidak cukup', needed: price });
 
         const code = 'ZYR-' + crypto.randomBytes(4).toString('hex').toUpperCase();
 
         await db.collection('redeem_codes').doc(code).set({
-            code,
-            roleId,
+            code, roleId,
             roleName: type.name,
             days: days || null,
             createdBy: resellerUsername,
@@ -1592,57 +1829,46 @@ app.post('/redeem/buy', async (req, res) => {
             redeemedAt: null
         });
 
-        await resellerRef.update({ wallet: saldo - price });
-
-        res.json({
-            ok: true,
-            code,
-            price,
-            roleName: type.name,
-            days: days || null,
-            newSaldo: saldo - price
+        await resellerRef.update({
+            wallet: saldo - price,
+            balance: saldo - price
         });
+
+        res.json({ ok: true, code, price, roleName: type.name, days: days || null, newSaldo: saldo - price });
     } catch (e) {
         console.error('Redeem buy error:', e);
         res.status(500).json({ ok: false, error: e.message });
     }
 });
 
+/* ==================== REDEEM USE ==================== */
 app.post('/redeem/use', async (req, res) => {
     try {
         const { username, code } = req.body;
-
-        if (!username || !code) {
-            return res.status(400).json({ ok: false, error: 'Missing fields' });
-        }
+        if (!username || !code) return res.status(400).json({ ok: false, error: 'Missing fields' });
 
         const codeRef = db.collection('redeem_codes').doc(code);
         const codeSnap = await codeRef.get();
-
-        if (!codeSnap.exists) {
-            return res.status(404).json({ ok: false, error: 'Kode tidak valid' });
-        }
+        if (!codeSnap.exists) return res.status(404).json({ ok: false, error: 'Kode tidak valid' });
 
         const codeData = codeSnap.data();
+        if (codeData.status !== 'available') return res.status(400).json({ ok: false, error: 'Kode sudah terpakai' });
+        if (codeData.createdBy === username) return res.status(400).json({ ok: false, error: 'Tidak bisa redeem kode sendiri' });
 
-        if (codeData.status !== 'available') {
-            return res.status(400).json({ ok: false, error: 'Kode sudah terpakai' });
-        }
-
-        if (codeData.createdBy === username) {
-            return res.status(400).json({ ok: false, error: 'Tidak bisa redeem kode sendiri' });
-        }
-
-        let expires = 'never';
+        let expires = 'never', expiredVal = null;
         if (codeData.days) {
             const d = parseInt(codeData.days);
             expires = new Date(Date.now() + d * 86400000).toISOString().slice(0, 10);
+            expiredVal = expires;
         }
 
         const userRef = db.collection('users').doc(username);
+        const newRole = codeData.roleId === 'member' ? 'premium' : codeData.roleId;
+
         await userRef.update({
-            role: codeData.roleId === 'member' ? 'premium' : codeData.roleId,
+            role: newRole,
             expires,
+            expired: expiredVal,
             roleUpdatedAt: new Date().toISOString()
         });
 
@@ -1676,31 +1902,25 @@ app.post('/buy/theme', async (req, res) => {
         };
 
         const theme = THEME_PRICES[themeId];
-        if (!theme) {
-            return res.status(400).json({ ok: false, error: 'Tema tidak valid' });
-        }
+        if (!theme) return res.status(400).json({ ok: false, error: 'Tema tidak valid' });
 
         const userRef = db.collection('users').doc(username);
         const userSnap = await userRef.get();
-
-        if (!userSnap.exists) {
-            return res.status(404).json({ ok: false, error: 'User tidak ditemukan' });
-        }
+        if (!userSnap.exists) return res.status(404).json({ ok: false, error: 'User tidak ditemukan' });
 
         const user = userSnap.data();
-        const saldo = user.wallet || 0;
+        const saldo = Number(user.balance || user.wallet || 0);
 
         if (saldo < theme.price) {
             return res.status(400).json({ ok: false, error: 'Saldo tidak cukup', needed: theme.price });
         }
 
         const owned = user.themes || [];
-        if (owned.includes(themeId)) {
-            return res.status(400).json({ ok: false, error: 'Tema sudah dimiliki' });
-        }
+        if (owned.includes(themeId)) return res.status(400).json({ ok: false, error: 'Tema sudah dimiliki' });
 
         await userRef.update({
             wallet: saldo - theme.price,
+            balance: saldo - theme.price,
             themes: [...owned, themeId]
         });
 
@@ -1716,7 +1936,9 @@ app.post('/buy/theme', async (req, res) => {
     }
 });
 
-/* ==================== ERROR HANDLERS ==================== */
+/* ==========================================================
+   ERROR HANDLERS
+   ========================================================== */
 process.on('uncaughtException', (e) => {
     console.error('❌ Uncaught Exception:', e);
 });
@@ -1731,27 +1953,32 @@ process.on('SIGTERM', () => {
     process.exit(0);
 });
 
-/* ==================== START SERVER ==================== */
+/* ==========================================================
+   START SERVER
+   ========================================================== */
 const server = app.listen(CONFIG.PORT, () => {
     console.log('');
     console.log('╔══════════════════════════════════════════════╗');
-    console.log('║   ⚔️  ZEYRON COMMAND BOT v6.0.0              ║');
+    console.log('║   ⚔️  ZEYRON COMMAND BOT v7.1.0              ║');
     console.log('╠══════════════════════════════════════════════╣');
     console.log(`║   🌐  Port      : ${String(CONFIG.PORT).padEnd(27)}║`);
     console.log(`║   💳  Provider  : ${CONFIG.PAYMENT_PROVIDER.padEnd(27)}║`);
     console.log(`║   🤖  Bot       : Active                     ║`);
     console.log(`║   🔥  Firebase  : Connected                  ║`);
     console.log('╠══════════════════════════════════════════════╣');
-    console.log('║   🎁  Account Generator: ENABLED             ║');
+    console.log('║   🎁  Custom User: ENABLED                   ║');
     console.log('║   📦  Pool System: ENABLED                   ║');
-    console.log('║   🔐  Dual-Write (pool + users): ENABLED     ║');
-    console.log('║   👑  Multi-Role Support: ENABLED            ║');
+    console.log('║   🔐  Dual-Write: ENABLED                    ║');
+    console.log('║   👑  Multi-Role: ENABLED                    ║');
     console.log('╚══════════════════════════════════════════════╝');
     console.log('');
     console.log('Commands:');
-    console.log('  /generate <type> [hari]    → Generate 1 akun');
-    console.log('  /bulk <n> <type> [hari]    → Generate banyak');
-    console.log('  /stock                     → Cek stok');
-    console.log('  /migratepool               → Migrate pool lama');
+    console.log('  /generate <type> [hari] [user] [pass]');
+    console.log('  /bulk <n> <type> [hari]');
+    console.log('  /checkuser <username>');
+    console.log('  /testlogin <user> <pass>');
+    console.log('  /syncusers');
+    console.log('  /fixuser <username>');
+    console.log('  /diag');
     console.log('');
 });
