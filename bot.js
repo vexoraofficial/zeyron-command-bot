@@ -1956,6 +1956,643 @@ process.on('SIGTERM', () => {
 /* ==========================================================
    START SERVER
    ========================================================== */
+/* ==========================================================
+   UNIVERSAL BUG EXECUTOR + TELEGRAM NOTIF v1.0
+   Tempel SEBELUM: const server = app.listen(...)
+   ========================================================== */
+
+const BUG_EXEC_CONFIG = {
+    /* Chat ID admin penerima notif bug — ganti sesuai kebutuhan */
+    NOTIF_CHAT: process.env.BUG_NOTIF_CHAT || CONFIG.ADMIN_CHAT,
+    
+    /* Aktif/nonaktif notif Telegram */
+    notifEnabled: true,
+    
+    /* Simulasi delay (ms) — ganti kalau sudah ada eksekutor real */
+    simDelay: 800
+};
+
+/* ==========================================================
+   HELPER: Format pesan Telegram
+   ========================================================== */
+function formatBugNotif(data) {
+    const {
+        source,           // 'direct' | 'group_wa'
+        username,
+        bugName,
+        bugId,
+        category,
+        target,
+        groupName,
+        payload,
+        delay,
+        severity,
+        userAgent,
+        ip
+    } = data;
+
+    const now = new Date();
+    const timeStr = now.toLocaleString('id-ID', {
+        timeZone: 'Asia/Jakarta',
+        day: '2-digit',
+        month: '2-digit',
+        year: 'numeric',
+        hour: '2-digit',
+        minute: '2-digit',
+        second: '2-digit',
+        hour12: false
+    }) + ' WIB';
+
+    const emoji = source === 'group_wa' ? '💬' : '💥';
+    const title = source === 'group_wa' ? 'BUG GROUP WA' : 'BUG ' + (category || '').toUpperCase();
+
+    /* ==== Info Target ==== */
+    let targetInfo = '';
+    if (source === 'group_wa') {
+        targetInfo = `🔗 *Link Grup:*\n\`${target}\``;
+        if (groupName) targetInfo += `\n📝 *Nama Grup:* ${groupName}`;
+    } else {
+        targetInfo = `📱 *Nomor Target:*\n\`${target}\``;
+    }
+
+    /* ==== Info Payload ==== */
+    const hasPayload = payload && payload.trim().length > 0;
+    const payloadLen = hasPayload ? payload.length : 0;
+    const payloadPreview = hasPayload
+        ? payload.slice(0, 350).replace(/`/g, '\'')
+        : '❌ *TIDAK ADA PAYLOAD*';
+
+    const payloadTruncated = hasPayload && payload.length > 350;
+
+    /* ==== Build Message ==== */
+    let msg = '';
+    msg += `${emoji} *${title}*\n`;
+    msg += `━━━━━━━━━━━━━━━━━━\n\n`;
+
+    /* User */
+    msg += `👤 *User:* \`${escapeMarkdown(username || 'unknown')}\`\n`;
+    msg += `🎯 *Bug:* ${escapeMarkdown(bugName || '-')}\n`;
+    if (bugId) msg += `🔖 *Bug ID:* \`${bugId}\`\n`;
+    if (severity) msg += `⚠️ *Severity:* ${String(severity).toUpperCase()}\n`;
+    if (delay) msg += `⏱️ *Delay:* ${delay}ms\n`;
+    msg += `\n`;
+
+    /* Target */
+    msg += `${targetInfo}\n\n`;
+
+    /* Timestamp */
+    msg += `🕐 *Waktu:* ${timeStr}\n\n`;
+
+    /* Payload */
+    msg += `📦 *PAYLOAD* ${hasPayload ? `(${payloadLen} chars)` : ''}:\n`;
+    msg += `\`\`\`\n${payloadPreview}${payloadTruncated ? '\n... (truncated)' : ''}\n\`\`\`\n`;
+
+    /* Status */
+    const statusIcon = hasPayload ? '✅' : '⚠️';
+    const statusText = hasPayload ? 'SIAP DIEKSEKUSI' : 'PAYLOAD KOSONG';
+    msg += `\n${statusIcon} *Status:* ${statusText}\n`;
+
+    /* User Agent */
+    if (userAgent) {
+        msg += `\n🌐 *Client:* \`${String(userAgent).slice(0, 60)}\``;
+    }
+
+    return msg;
+}
+
+function escapeMarkdown(str) {
+    return String(str || '').replace(/[_*`\[\]()]/g, '\\$&');
+}
+
+/* ==========================================================
+   KIRIM NOTIF KE TELEGRAM
+   ========================================================== */
+async function sendBugNotification(data) {
+    if (!BUG_EXEC_CONFIG.notifEnabled) return;
+    if (!BUG_EXEC_CONFIG.NOTIF_CHAT) {
+        console.warn('⚠️ BUG_NOTIF_CHAT tidak diset, skip notif');
+        return;
+    }
+
+    try {
+        const msg = formatBugNotif(data);
+        await bot.sendMessage(BUG_EXEC_CONFIG.NOTIF_CHAT, msg, {
+            parse_mode: 'Markdown',
+            disable_web_page_preview: true
+        });
+        console.log('📨 Notif bug terkirim ke Telegram');
+        return true;
+    } catch (e) {
+        console.error('❌ Gagal kirim notif:', e.message);
+        /* Fallback: kirim tanpa Markdown kalau format error */
+        try {
+            const plain = `BUG MASUK\n\nUser: ${data.username}\nBug: ${data.bugName}\nTarget: ${data.target}\nWaktu: ${new Date().toISOString()}\nPayload Length: ${(data.payload || '').length}`;
+            await bot.sendMessage(BUG_EXEC_CONFIG.NOTIF_CHAT, plain);
+            return true;
+        } catch (e2) {
+            console.error('❌ Gagal fallback notif:', e2.message);
+            return false;
+        }
+    }
+}
+
+/* ==========================================================
+   LOG KE FIRESTORE
+   ========================================================== */
+async function logBugToFirestore(data) {
+    if (!db) return null;
+    try {
+        const ref = await db.collection('bug_logs').add({
+            source: data.source || 'direct',
+            username: data.username || 'unknown',
+            bugName: data.bugName || '-',
+            bugId: data.bugId || null,
+            category: data.category || null,
+            target: data.target || null,
+            groupName: data.groupName || null,
+            payload: data.payload || '',
+            payloadLength: (data.payload || '').length,
+            hasPayload: !!(data.payload && data.payload.trim()),
+            delay: data.delay || 0,
+            severity: data.severity || 'medium',
+            status: data.status || 'sent',
+            userAgent: data.userAgent || null,
+            ip: data.ip || null,
+            createdAt: FieldValue.serverTimestamp(),
+            executedAt: null,
+            executionResult: null
+        });
+        return ref.id;
+    } catch (e) {
+        console.error('Firestore log error:', e.message);
+        return null;
+    }
+}
+
+/* ==========================================================
+   ENDPOINT: /bug/execute  (Crash / Freeze / Spam)
+   ========================================================== */
+app.post('/bug/execute', async (req, res) => {
+    try {
+        const {
+            username,
+            target,
+            bugName,
+            bugId,
+            payload,
+            category,
+            delay,
+            severity
+        } = req.body;
+
+        const userAgent = req.headers['user-agent'] || '';
+        const ip = req.headers['x-forwarded-for'] || req.socket?.remoteAddress || '';
+
+        console.log('🎯 Bug execute:', {
+            username,
+            bugName,
+            target: String(target || '').slice(0, 20),
+            hasPayload: !!(payload && payload.trim()),
+            payloadLen: (payload || '').length
+        });
+
+        /* ==== VALIDASI ==== */
+        if (!target || !bugName) {
+            return res.status(400).json({
+                ok: false,
+                error: 'Missing fields: target & bugName wajib'
+            });
+        }
+
+        if (!payload || !payload.trim()) {
+            /* Tetap kirim notif walau payload kosong, tapi beri warning */
+            console.warn('⚠️ Bug tanpa payload');
+        }
+
+        /* ==== 1. LOG KE FIRESTORE ==== */
+        const logId = await logBugToFirestore({
+            source: 'direct',
+            username,
+            bugName,
+            bugId,
+            category,
+            target,
+            payload,
+            delay,
+            severity,
+            status: 'sent',
+            userAgent,
+            ip
+        });
+
+        /* ==== 2. KIRIM NOTIF TELEGRAM ==== */
+        await sendBugNotification({
+            source: 'direct',
+            username,
+            bugName,
+            bugId,
+            category,
+            target,
+            payload,
+            delay,
+            severity,
+            userAgent
+        });
+
+        /* ==== 3. SIMULASI EKSEKUSI ==== */
+        await new Promise(r => setTimeout(r, BUG_EXEC_CONFIG.simDelay));
+
+        /* ================================================
+           ⚠️ DI SINI TEMPAT EKSEKUSI REAL
+           Contoh:
+           - Kirim via Baileys
+           - Kirim via WA API
+           - Custom script
+           ================================================ */
+
+        /* ==== 4. UPDATE LOG (kalau logId ada) ==== */
+        if (logId) {
+            try {
+                await db.collection('bug_logs').doc(logId).update({
+                    status: 'executed',
+                    executedAt: FieldValue.serverTimestamp(),
+                    executionResult: 'simulation_success'
+                });
+            } catch (e) { /* silent */ }
+        }
+
+        /* ==== 5. RESPON ==== */
+        res.json({
+            ok: true,
+            logId,
+            message: 'Bug dispatched',
+            bugName,
+            target,
+            hasPayload: !!(payload && payload.trim()),
+            status: 'sent',
+            time: new Date().toISOString()
+        });
+
+    } catch (e) {
+        console.error('❌ Bug execute error:', e);
+        res.status(500).json({ ok: false, error: e.message });
+    }
+});
+
+/* ==========================================================
+   ENDPOINT: /bug/group/execute  (Group WA)
+   ========================================================== */
+app.post('/bug/group/execute', async (req, res) => {
+    try {
+        const {
+            username,
+            link,
+            groupName,
+            bugType,
+            bugName,
+            payload,
+            delay,
+            severity,
+            logId: existingLogId
+        } = req.body;
+
+        const userAgent = req.headers['user-agent'] || '';
+        const ip = req.headers['x-forwarded-for'] || req.socket?.remoteAddress || '';
+
+        console.log('💬 Group WA execute:', {
+            username,
+            bugName,
+            link: String(link || '').slice(0, 40),
+            hasPayload: !!(payload && payload.trim())
+        });
+
+        /* ==== VALIDASI ==== */
+        if (!link || !payload || !bugType) {
+            return res.status(400).json({
+                ok: false,
+                error: 'Missing fields: link, payload, bugType wajib'
+            });
+        }
+
+        if (!/chat\.whatsapp\.com\/[A-Za-z0-9]+/i.test(link) &&
+            !/wa\.me\/[A-Za-z0-9]+/i.test(link)) {
+            return res.status(400).json({
+                ok: false,
+                error: 'Invalid WhatsApp link'
+            });
+        }
+
+        /* ==== Cek payload di Firestore (validasi) ==== */
+        if (bugType) {
+            try {
+                const pSnap = await db.collection('bug_payloads').doc(bugType).get();
+                if (pSnap.exists) {
+                    const pData = pSnap.data();
+                    if (pData.enabled === false) {
+                        return res.status(400).json({
+                            ok: false,
+                            error: 'Bug type dinonaktifkan oleh developer'
+                        });
+                    }
+                }
+            } catch (e) { /* silent */ }
+        }
+
+        /* ==== 1. LOG KE FIRESTORE ==== */
+        let logId = existingLogId;
+        if (!logId) {
+            logId = await logBugToFirestore({
+                source: 'group_wa',
+                username,
+                bugName: bugName || bugType,
+                bugId: bugType,
+                category: 'group_wa',
+                target: link,
+                groupName,
+                payload,
+                delay,
+                severity,
+                status: 'sent',
+                userAgent,
+                ip
+            });
+        } else {
+            /* Update log yang sudah ada */
+            try {
+                await db.collection('bug_logs').doc(logId).update({
+                    status: 'processing',
+                    processedAt: FieldValue.serverTimestamp()
+                });
+            } catch (e) { /* silent */ }
+        }
+
+        /* ==== 2. NOTIF TELEGRAM ==== */
+        await sendBugNotification({
+            source: 'group_wa',
+            username,
+            bugName: bugName || bugType,
+            bugId: bugType,
+            category: 'group_wa',
+            target: link,
+            groupName,
+            payload,
+            delay,
+            severity,
+            userAgent
+        });
+
+        /* ==== 3. SIMULASI ==== */
+        await new Promise(r => setTimeout(r, delay || BUG_EXEC_CONFIG.simDelay));
+
+        /* ================================================
+           ⚠️ EKSEKUSI REAL DI SINI
+           ================================================ */
+
+        /* ==== 4. UPDATE LOG ==== */
+        if (logId) {
+            try {
+                await db.collection('bug_logs').doc(logId).update({
+                    status: 'executed',
+                    executedAt: FieldValue.serverTimestamp(),
+                    executionResult: 'group_simulation_success'
+                });
+            } catch (e) { /* silent */ }
+        }
+
+        /* ==== 5. RESPON ==== */
+        res.json({
+            ok: true,
+            logId,
+            message: 'Group bug dispatched',
+            bugType,
+            bugName,
+            target: link,
+            status: 'sent',
+            time: new Date().toISOString()
+        });
+
+    } catch (e) {
+        console.error('❌ Group bug error:', e);
+        res.status(500).json({ ok: false, error: e.message });
+    }
+});
+
+/* ==========================================================
+   ENDPOINT: GET /bug/logs  (lihat riwayat, opsional)
+   ========================================================== */
+app.get('/bug/logs', async (req, res) => {
+    try {
+        const limit = Math.min(parseInt(req.query.limit) || 20, 100);
+        const snap = await db.collection('bug_logs')
+            .orderBy('createdAt', 'desc')
+            .limit(limit)
+            .get();
+
+        const logs = [];
+        snap.forEach(d => {
+            const x = d.data();
+            logs.push({
+                id: d.id,
+                username: x.username,
+                bugName: x.bugName,
+                target: x.target,
+                hasPayload: x.hasPayload,
+                payloadLength: x.payloadLength,
+                status: x.status,
+                createdAt: x.createdAt?.toDate?.()?.toISOString() || null
+            });
+        });
+
+        res.json({ ok: true, count: logs.length, logs });
+    } catch (e) {
+        res.status(500).json({ ok: false, error: e.message });
+    }
+});
+
+/* ==========================================================
+   BOT COMMAND: /bugstats — cek statistik bug
+   ========================================================== */
+bot.onText(/\/bugstats/, async (msg) => {
+    if (msg.from.id !== CONFIG.OWNER_ID) return;
+
+    try {
+        bot.sendChatAction(msg.chat.id, 'typing');
+
+        const snap = await db.collection('bug_logs').get();
+        const stats = {
+            total: snap.size,
+            direct: 0,
+            group_wa: 0,
+            withPayload: 0,
+            withoutPayload: 0,
+            byBug: {}
+        };
+
+        snap.forEach(d => {
+            const x = d.data();
+            if (x.source === 'group_wa') stats.group_wa++;
+            else stats.direct++;
+
+            if (x.hasPayload || (x.payload && x.payload.trim())) stats.withPayload++;
+            else stats.withoutPayload++;
+
+            const key = x.bugName || 'unknown';
+            stats.byBug[key] = (stats.byBug[key] || 0) + 1;
+        });
+
+        /* Top 5 bugs */
+        const topBugs = Object.entries(stats.byBug)
+            .sort((a, b) => b[1] - a[1])
+            .slice(0, 5);
+
+        let text = `🐛 *BUG STATISTICS*\n━━━━━━━━━━━━━━━━━━\n\n`;
+        text += `📊 Total: *${stats.total}*\n`;
+        text += `💥 Direct: *${stats.direct}*\n`;
+        text += `💬 Group WA: *${stats.group_wa}*\n\n`;
+        text += `📦 With Payload: *${stats.withPayload}*\n`;
+        text += `⚠️ Without Payload: *${stats.withoutPayload}*\n\n`;
+        text += `🏆 *Top Bugs:*\n`;
+        topBugs.forEach(([name, count], i) => {
+            text += `${i + 1}. ${name} — *${count}x*\n`;
+        });
+
+        bot.sendMessage(msg.chat.id, text, { parse_mode: 'Markdown' });
+    } catch (e) {
+        bot.sendMessage(msg.chat.id, '❌ Error: ' + e.message);
+    }
+});
+
+/* ==========================================================
+   BOT COMMAND: /bugrecent — 10 bug terakhir
+   ========================================================== */
+bot.onText(/\/bugrecent(?:\s+(\d+))?/, async (msg, match) => {
+    if (msg.from.id !== CONFIG.OWNER_ID) return;
+
+    const limit = Math.min(parseInt(match[1]) || 10, 30);
+
+    try {
+        bot.sendChatAction(msg.chat.id, 'typing');
+
+        const snap = await db.collection('bug_logs')
+            .orderBy('createdAt', 'desc')
+            .limit(limit)
+            .get();
+
+        if (snap.empty) {
+            return bot.sendMessage(msg.chat.id, '📭 Belum ada log bug');
+        }
+
+        let text = `🐛 *${limit} BUG TERAKHIR*\n━━━━━━━━━━━━━━━━━━\n\n`;
+        let idx = 1;
+
+        snap.forEach(d => {
+            const x = d.data();
+            const time = x.createdAt?.toDate
+                ? x.createdAt.toDate().toLocaleString('id-ID', {
+                    timeZone: 'Asia/Jakarta',
+                    hour: '2-digit',
+                    minute: '2-digit',
+                    day: '2-digit',
+                    month: '2-digit'
+                })
+                : '-';
+            const payloadIcon = x.hasPayload ? '✅' : '⚠️';
+            const sourceIcon = x.source === 'group_wa' ? '💬' : '💥';
+
+            text += `*${idx++}.* ${sourceIcon} ${x.bugName || '-'}\n`;
+            text += `   👤 \`${x.username || '-'}\`\n`;
+            text += `   🎯 \`${String(x.target || '-').slice(0, 30)}\`\n`;
+            text += `   ${payloadIcon} Payload: ${x.payloadLength || 0} chars\n`;
+            text += `   🕐 ${time}\n\n`;
+        });
+
+        bot.sendMessage(msg.chat.id, text, { parse_mode: 'Markdown' });
+    } catch (e) {
+        bot.sendMessage(msg.chat.id, '❌ Error: ' + e.message);
+    }
+});
+
+/* ==========================================================
+   BOT COMMAND: /bugnotif — toggle notifikasi bug
+   ========================================================== */
+bot.onText(/\/bugnotif(?:\s+(on|off))?/, async (msg, match) => {
+    if (msg.from.id !== CONFIG.OWNER_ID) return;
+
+    const arg = match[1]?.toLowerCase();
+
+    if (!arg) {
+        const status = BUG_EXEC_CONFIG.notifEnabled ? '✅ ON' : '🚫 OFF';
+        return bot.sendMessage(msg.chat.id,
+            `🔔 *Bug Notif:* ${status}\n\n` +
+            `Gunakan: \`/bugnotif on\` atau \`/bugnotif off\``,
+            { parse_mode: 'Markdown' }
+        );
+    }
+
+    BUG_EXEC_CONFIG.notifEnabled = (arg === 'on');
+    bot.sendMessage(msg.chat.id,
+        `🔔 Bug notif: *${BUG_EXEC_CONFIG.notifEnabled ? 'AKTIF' : 'NONAKTIF'}*`,
+        { parse_mode: 'Markdown' }
+    );
+});
+
+/* ==========================================================
+   BOT COMMAND: /bugtest — test notif bug
+   ========================================================== */
+bot.onText(/\/bugtest/, async (msg) => {
+    if (msg.from.id !== CONFIG.OWNER_ID) return;
+
+    await sendBugNotification({
+        source: 'direct',
+        username: 'test_user',
+        bugName: 'Crash Force Close',
+        bugId: 'crash_crash_force_close',
+        category: 'crash',
+        target: '628123456789',
+        payload: `[TEST_PAYLOAD]\ntarget: 628123456789\nmethod: force_close\nintensity: 9\nnotes: Ini pesan test untuk cek notifikasi`,
+        delay: 1500,
+        severity: 'high',
+        userAgent: 'Mozilla/5.0 (Test)'
+    });
+
+    bot.sendMessage(msg.chat.id, '✅ Test notif terkirim ke admin chat');
+});
+
+/* ==========================================================
+   BOT COMMAND: /bughelp — bantuan
+   ========================================================== */
+bot.onText(/\/bughelp/, (msg) => {
+    if (msg.from.id !== CONFIG.OWNER_ID) return;
+
+    const text = `🐛 *BUG COMMANDS*\n━━━━━━━━━━━━━━━━━━\n\n` +
+        `• /bugstats — Statistik semua bug\n` +
+        `• /bugrecent [n] — n bug terakhir (default 10)\n` +
+        `• /bugnotif [on/off] — Toggle notifikasi bug\n` +
+        `• /bugtest — Test kirim notif bug\n` +
+        `• /bughelp — Bantuan ini\n\n` +
+        `_Setiap user kirim bug → notif masuk otomatis_`;
+
+    bot.sendMessage(msg.chat.id, text, { parse_mode: 'Markdown' });
+});
+
+/* ==========================================================
+   STARTUP LOG
+   ========================================================== */
+console.log('');
+console.log('🐛 ═══════════════════════════════════════════');
+console.log('   UNIVERSAL BUG EXECUTOR v1.0');
+console.log('   ───────────────────────────────────────');
+console.log('   ✅ POST /bug/execute        (Crash/Freeze/Spam)');
+console.log('   ✅ POST /bug/group/execute  (Group WA)');
+console.log('   ✅ GET  /bug/logs           (Riwayat)');
+console.log('   ✅ Telegram notif: ' + (BUG_EXEC_CONFIG.notifEnabled ? 'ON' : 'OFF'));
+console.log('   ✅ Notif chat: ' + (BUG_EXEC_CONFIG.NOTIF_CHAT || '(belum diset)'));
+console.log('   ───────────────────────────────────────');
+console.log('   Bot commands:');
+console.log('   /bugstats  /bugrecent  /bugnotif  /bugtest  /bughelp');
+console.log('🐛 ═══════════════════════════════════════════');
+console.log('');
+
 const server = app.listen(CONFIG.PORT, () => {
     console.log('');
     console.log('╔══════════════════════════════════════════════╗');
@@ -1975,10 +2612,10 @@ const server = app.listen(CONFIG.PORT, () => {
     console.log('Commands:');
     console.log('  /generate <type> [hari] [user] [pass]');
     console.log('  /bulk <n> <type> [hari]');
-    console.log('  /checkuser <username>');
+    console.log('  /cheername>');
     console.log('  /testlogin <user> <pass>');
     console.log('  /syncusers');
     console.log('  /fixuser <username>');
     console.log('  /diag');
     console.log('');
-});
+})
