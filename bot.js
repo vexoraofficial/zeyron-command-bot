@@ -1,15 +1,21 @@
 /* ==========================================================
-   ZEYRON COMMAND — BOT TELEGRAM v7.1 FINAL
+   ZEYRON COMMAND — BOT TELEGRAM v8.0 ULTIMATE
    File: bot.js
    
-   FITUR v7.1:
-   • Custom username & password di /generate
-   • Dual-write fields (wallet+balance, expires+expired)
-   • Akun generate LANGSUNG login di index.html
-   • Auto-validation username unik
-   • Commands: /checkuser /testlogin /syncusers /fixuser /diag
-   • Fix bug /bulk sendDocument
+   UPGRADE dari v7.1:
+   • API Key auth untuk endpoint bug
+   • Rate limiting anti-spam
+   • Payload size validation
+   • dotenv support
+   • Verbose logging toggle
+   • Auto cleanup rate limit map
+   • Bug Executor (Crash/Freeze/Spam/Group WA)
+   • Telegram notif real-time
+   • Semua fitur v7.1 tetap ada 100%
    ========================================================== */
+
+/* ========== DOTENV (local dev — optional) ========== */
+try { require('dotenv').config(); } catch (e) { /* optional */ }
 
 const express = require('express');
 const TelegramBot = require('node-telegram-bot-api');
@@ -18,23 +24,51 @@ const cors = require('cors');
 const crypto = require('crypto');
 
 /* ==========================================================
-   CONFIG
+   CONFIG — SEMUA DI ATAS
    ========================================================== */
 const CONFIG = {
+    /* ==== BOT ==== */
     BOT_TOKEN: process.env.BOT_TOKEN || '8929798096:AAFrynjFbR9ejXt_N2kvnGSe4xv5sNbCXb8',
     OWNER_ID: parseInt(process.env.OWNER_ID || '8790176339'),
     ADMIN_CHAT: parseInt(process.env.ADMIN_CHAT || '-1004425930502'),
 
+    /* ==== SERVER ==== */
     PORT: process.env.PORT || 3000,
     BASE_URL: process.env.BASE_URL || 'http://localhost:3000',
+    VERBOSE: process.env.VERBOSE === 'true',
 
+    /* ==== PAYMENT ==== */
     PAYMENT_PROVIDER: process.env.PAYMENT_PROVIDER || 'demo',
     PAYMENT_API_KEY: process.env.PAYMENT_API_KEY || '',
     PAYMENT_PROJECT: process.env.PAYMENT_PROJECT || 'zeyron-command',
     PAYMENT_MERCHANT: process.env.PAYMENT_MERCHANT || 'ZEYRON COMMAND',
-
     WEBHOOK_SECRET: process.env.WEBHOOK_SECRET || 'zeyron_secret_2026',
-    SERVICE_ACCOUNT_PATH: process.env.SERVICE_ACCOUNT_PATH || './serviceAccountKey.json'
+
+    /* ==== FIREBASE ==== */
+    SERVICE_ACCOUNT_PATH: process.env.SERVICE_ACCOUNT_PATH || './serviceAccountKey.json',
+
+    /* ==== BUG EXECUTOR ==== */
+    BUG_API_KEY: process.env.BUG_API_KEY || 'zeyron_bug_secret_2026',
+    BUG_NOTIF_CHAT: process.env.BUG_NOTIF_CHAT || null, // null = pakai ADMIN_CHAT
+    BUG_NOTIF_ENABLED: process.env.BUG_NOTIF_ENABLED !== 'false', // default: true
+    BUG_SIM_DELAY: parseInt(process.env.BUG_SIM_DELAY || '800'),
+    BUG_PAYLOAD_MAX: 10000,      // max 10KB per payload
+    BUG_RATE_LIMIT: {
+        perMinute: 5,
+        perHour: 30,
+        cooldownMs: 3000
+    }
+};
+
+/* ==========================================================
+   LOGGER HELPER
+   ========================================================== */
+const logger = {
+    info: (...args) => console.log('ℹ️', ...args),
+    warn: (...args) => console.warn('⚠️', ...args),
+    error: (...args) => console.error('❌', ...args),
+    success: (...args) => console.log('✅', ...args),
+    debug: (...args) => { if (CONFIG.VERBOSE) console.log('🔍', ...args); }
 };
 
 /* ==========================================================
@@ -78,10 +112,10 @@ try {
     if (process.env.FIREBASE_KEY_BASE64) {
         const json = Buffer.from(process.env.FIREBASE_KEY_BASE64, 'base64').toString('utf8');
         serviceAccount = JSON.parse(json);
-        console.log('🔥 Firebase: BASE64 from env');
+        logger.info('Firebase: BASE64 from env');
     } else {
         serviceAccount = require(CONFIG.SERVICE_ACCOUNT_PATH);
-        console.log('🔥 Firebase: Local file');
+        logger.info('Firebase: Local file');
     }
 
     admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
@@ -89,12 +123,12 @@ try {
     FieldValue = admin.firestore.FieldValue;
     Timestamp = admin.firestore.Timestamp;
 
-    console.log('✅ Firebase Admin connected');
+    logger.success('Firebase Admin connected');
     console.log('📌 Project ID  :', serviceAccount.project_id);
     console.log('📌 Client Email:', serviceAccount.client_email);
     console.log('⚠️  Pastikan projectId di index.html SAMA dengan ini!');
 } catch (e) {
-    console.error('❌ Firebase init error:', e.message);
+    logger.error('Firebase init error:', e.message);
     process.exit(1);
 }
 
@@ -104,9 +138,9 @@ try {
 let bot;
 try {
     bot = new TelegramBot(CONFIG.BOT_TOKEN, { polling: true });
-    console.log('🤖 Bot Telegram connected');
+    logger.success('Bot Telegram connected');
 } catch (e) {
-    console.error('❌ Bot init error:', e.message);
+    logger.error('Bot init error:', e.message);
     process.exit(1);
 }
 
@@ -144,8 +178,17 @@ function calculateExpiry(typeId, days) {
     return Timestamp.fromDate(new Date(Date.now() + d * 86400000));
 }
 
+function escapeMarkdown(str) {
+    return String(str || '').replace(/[_*`\[\]()]/g, '\\$&');
+}
+
+function isValidWALink(link) {
+    return /chat\.whatsapp\.com\/[A-Za-z0-9]+/i.test(link) ||
+           /wa\.me\/[A-Za-z0-9]+/i.test(link);
+}
+
 /* ==========================================================
-   🆕 VALIDATORS — untuk custom username & password
+   VALIDATORS
    ========================================================== */
 function validateUsername(username) {
     if (!username || typeof username !== 'string') {
@@ -172,33 +215,105 @@ function validatePassword(password) {
     return { ok: true, value: password };
 }
 
+function validatePayload(payload) {
+    if (!payload) return { ok: true, value: '' };
+    if (typeof payload !== 'string') return { ok: false, error: 'Payload harus string' };
+    if (payload.length > CONFIG.BUG_PAYLOAD_MAX) {
+        return { ok: false, error: `Payload terlalu besar (max ${CONFIG.BUG_PAYLOAD_MAX} chars)` };
+    }
+    return { ok: true, value: payload };
+}
+
 async function isUsernameTaken(username) {
     if (!username) return false;
-    const u = String(username).trim().toLowerCase();
-
-    // Cek di users collection
     try {
         const userSnap = await db.collection('users').doc(username).get();
         if (userSnap.exists) return true;
 
-        // Cek variasi case
         const q = await db.collection('users')
             .where('username', '==', username).limit(1).get();
         if (!q.empty) return true;
 
-        // Cek di pool juga
         const poolQ = await db.collection('account_pool')
             .where('username', '==', username).limit(1).get();
         if (!poolQ.empty) return true;
     } catch (e) {
-        console.warn('isUsernameTaken error:', e.message);
+        logger.warn('isUsernameTaken error:', e.message);
     }
     return false;
 }
 
 /* ==========================================================
-   🔥 CORE BUILDER — userData COMPATIBLE (index.html + home.html)
-   Menulis DUA format sekaligus agar bisa login di mana saja.
+   SECURITY — API KEY MIDDLEWARE
+   ========================================================== */
+function requireApiKey(req, res, next) {
+    const apiKey = req.headers['x-api-key'] || req.body?.apiKey;
+    if (apiKey !== CONFIG.BUG_API_KEY) {
+        logger.warn('Unauthorized attempt:', req.ip, req.path);
+        return res.status(401).json({
+            ok: false,
+            error: 'Unauthorized — API key invalid'
+        });
+    }
+    next();
+}
+
+/* ==========================================================
+   SECURITY — RATE LIMITING
+   ========================================================== */
+const bugRateLimitMap = new Map();
+
+function checkBugRateLimit(identifier) {
+    const now = Date.now();
+    const key = String(identifier || 'anonymous').toLowerCase();
+
+    if (!bugRateLimitMap.has(key)) {
+        bugRateLimitMap.set(key, { minute: [], hour: [], last: 0 });
+    }
+
+    const data = bugRateLimitMap.get(key);
+
+    /* Cooldown */
+    if (now - data.last < CONFIG.BUG_RATE_LIMIT.cooldownMs) {
+        const wait = Math.ceil((CONFIG.BUG_RATE_LIMIT.cooldownMs - (now - data.last)) / 1000);
+        return { ok: false, error: `Tunggu ${wait}s sebelum kirim lagi`, code: 429 };
+    }
+
+    /* Filter windows */
+    data.minute = data.minute.filter(t => now - t < 60000);
+    data.hour = data.hour.filter(t => now - t < 3600000);
+
+    /* Check limits */
+    if (data.minute.length >= CONFIG.BUG_RATE_LIMIT.perMinute) {
+        return { ok: false, error: `Terlalu banyak (max ${CONFIG.BUG_RATE_LIMIT.perMinute}/menit)`, code: 429 };
+    }
+    if (data.hour.length >= CONFIG.BUG_RATE_LIMIT.perHour) {
+        return { ok: false, error: `Terlalu banyak (max ${CONFIG.BUG_RATE_LIMIT.perHour}/jam)`, code: 429 };
+    }
+
+    /* Record */
+    data.minute.push(now);
+    data.hour.push(now);
+    data.last = now;
+
+    return { ok: true };
+}
+
+/* Auto cleanup setiap 10 menit */
+setInterval(() => {
+    const now = Date.now();
+    let cleaned = 0;
+    bugRateLimitMap.forEach((data, key) => {
+        if (now - data.last > 3600000) {
+            bugRateLimitMap.delete(key);
+            cleaned++;
+        }
+    });
+    if (cleaned > 0) logger.debug(`Rate limit cleanup: ${cleaned} entries removed`);
+}, 600000);
+
+/* ==========================================================
+   CORE BUILDER — userData COMPATIBLE (index.html + home.html)
    ========================================================== */
 function buildUserData(params) {
     const {
@@ -207,37 +322,32 @@ function buildUserData(params) {
         source = 'bot_generator'
     } = params;
 
-    // Normalisasi expired (home.html Part 3)
     const expiredVal = (expires === 'never' || !expires) ? null : expires;
 
     return {
-        /* IDENTITY */
         username,
         password,
-        role,                       // 'premium' | 'reseller' | 'admin' | 'owner'
+        role,
 
-        /* MASA AKTIF (DUAL) */
-        expires,                    // index.html: 'never' | 'YYYY-MM-DD'
-        expired: expiredVal,        // home.html: null | 'YYYY-MM-DD'
+        /* Dual expires */
+        expires,
+        expired: expiredVal,
 
-        /* SALDO (DUAL) */
+        /* Dual balance */
         wallet: 0,
         balance: 0,
 
-        /* PROFILE */
-        avatar: '',
-        email: '',
-        phone: '',
+        /* Profile */
+        avatar: '', email: '', phone: '',
 
-        /* STATUS */
-        banned: false,
-        banReason: '',
+        /* Status */
+        banned: false, banReason: '',
 
-        /* METADATA (DUAL) */
+        /* Metadata dual */
         createdAt: new Date().toISOString(),
         joinedAt: new Date().toISOString(),
 
-        /* EXTRA */
+        /* Extra */
         type: typeId,
         typeName: typeName,
         days: days || null,
@@ -246,35 +356,28 @@ function buildUserData(params) {
         referral: 'REF-' + String(username).slice(0, 4).toUpperCase() +
                   crypto.randomBytes(2).toString('hex').toUpperCase(),
 
-        /* GAME DATA */
+        /* Game data */
         themes: [],
         achievements: [],
         exp: 0,
         additionalRoles: [],
 
-        /* TIMESTAMPS */
+        /* Timestamps */
         lastSeen: new Date().toISOString(),
         roleUpdatedAt: new Date().toISOString(),
 
-        /* FLAG */
+        /* Flag */
         loginReady: true
     };
 }
 
 /* ==========================================================
-   ACCOUNT GENERATOR v7.1 (dengan custom username/password)
-   
-   @param typeId       - 'member' | 'permanent' | dst
-   @param days         - durasi hari (untuk member)
-   @param generatedBy  - siapa yang generate
-   @param customUser   - (opsional) username custom
-   @param customPass   - (opsional) password custom
+   ACCOUNT GENERATOR
    ========================================================== */
 async function generateAccount(typeId, days, generatedBy = 'system', customUser = null, customPass = null) {
     const type = ACCOUNT_TYPES[typeId];
     if (!type) throw new Error(`Tipe "${typeId}" tidak valid`);
 
-    // Validasi durasi
     if (type.needsDuration) {
         const d = parseInt(days);
         if (isNaN(d) || d < type.minDays || d > type.maxDays) {
@@ -282,18 +385,15 @@ async function generateAccount(typeId, days, generatedBy = 'system', customUser 
         }
     }
 
-    /* ===== CUSTOM USERNAME VALIDATION ===== */
+    /* Username */
     let username;
     if (customUser) {
         const v = validateUsername(customUser);
         if (!v.ok) throw new Error('Username: ' + v.error);
-
         const taken = await isUsernameTaken(v.value);
         if (taken) throw new Error(`Username "${v.value}" sudah dipakai`);
-
         username = v.value;
     } else {
-        // Generate random, pastikan tidak bentrok
         let attempts = 0;
         do {
             username = generateUsername(typeId);
@@ -301,7 +401,7 @@ async function generateAccount(typeId, days, generatedBy = 'system', customUser 
         } while (await isUsernameTaken(username) && attempts < 10);
     }
 
-    /* ===== CUSTOM PASSWORD VALIDATION ===== */
+    /* Password */
     let password;
     if (customPass) {
         const v = validatePassword(customPass);
@@ -312,15 +412,10 @@ async function generateAccount(typeId, days, generatedBy = 'system', customUser 
     }
 
     const expiresAt = calculateExpiry(typeId, days);
+    let expires = (type.permanent || !expiresAt) ? 'never'
+                : expiresAt.toDate().toISOString().slice(0, 10);
 
-    let expires;
-    if (type.permanent || !expiresAt) {
-        expires = 'never';
-    } else {
-        expires = expiresAt.toDate().toISOString().slice(0, 10);
-    }
-
-    /* ===== 1. SIMPAN KE POOL ===== */
+    /* Simpan ke pool */
     const poolData = {
         username, password,
         type: typeId,
@@ -339,7 +434,7 @@ async function generateAccount(typeId, days, generatedBy = 'system', customUser 
 
     const poolRef = await db.collection('account_pool').add(poolData);
 
-    /* ===== 2. SIMPAN KE USERS ===== */
+    /* Simpan ke users */
     const userData = buildUserData({
         username, password,
         role: type.loginRole,
@@ -347,13 +442,12 @@ async function generateAccount(typeId, days, generatedBy = 'system', customUser 
         typeId,
         typeName: type.name,
         days: type.needsDuration ? parseInt(days) : null,
-        generatedBy,
-        source: 'bot_generator'
+        generatedBy
     });
 
     await db.collection('users').doc(username).set(userData);
 
-    console.log(`✅ Generated: ${username} | ${type.name} | role=${type.loginRole} | exp=${expires}`);
+    logger.success(`Generated: ${username} | ${type.name} | role=${type.loginRole} | exp=${expires}`);
 
     return {
         poolId: poolRef.id,
@@ -395,7 +489,7 @@ async function claimAccount(roleId, telegram, invoice) {
             invoice
         });
 
-        console.log(`📦 Claimed: ${data.username} → ${telegram}`);
+        logger.info(`Claimed from pool: ${data.username} → ${telegram}`);
 
         return {
             username: data.username,
@@ -407,9 +501,7 @@ async function claimAccount(roleId, telegram, invoice) {
         };
     }
 
-    // Pool kosong → auto-generate
-    console.log(`⚡ Pool kosong [${typeId}] — auto-generate`);
-
+    logger.info(`Pool kosong [${typeId}] — auto-generate`);
     const defaultDays = typeId === 'member' ? 7 : null;
     const newAcc = await generateAccount(typeId, defaultDays, 'auto_on_demand');
 
@@ -439,16 +531,15 @@ async function getStock() {
 }
 
 /* ==========================================================
-   🆕 SEND ACCOUNT TO TELEGRAM (reusable)
+   SEND ACCOUNT MESSAGE
    ========================================================== */
 async function sendAccountMessage(chatId, acc, extra = {}) {
     const expText = acc.expiresAt
         ? acc.expiresAt.toDate().toLocaleString('id-ID')
         : (acc.expires === 'never' || acc.permanent ? '♾️ Permanent' : '-');
 
-    const durText = acc.days
-        ? `${acc.days} hari`
-        : (acc.permanent ? 'Permanent' : '-');
+    const durText = acc.days ? `${acc.days} hari`
+                  : (acc.permanent ? 'Permanent' : '-');
 
     const customTag = acc.isCustom ? '\n🎨 *CUSTOM* oleh owner' : '';
 
@@ -467,6 +558,133 @@ async function sendAccountMessage(chatId, acc, extra = {}) {
     if (extra.footer) text += '\n\n' + extra.footer;
 
     return bot.sendMessage(chatId, text, { parse_mode: 'Markdown' });
+}
+
+/* ==========================================================
+   BUG EXECUTOR — FORMAT NOTIF
+   ========================================================== */
+function formatBugNotif(data) {
+    const {
+        source, username, bugName, bugId, category,
+        target, groupName, payload, delay, severity, userAgent
+    } = data;
+
+    const now = new Date();
+    const timeStr = now.toLocaleString('id-ID', {
+        timeZone: 'Asia/Jakarta',
+        day: '2-digit', month: '2-digit', year: 'numeric',
+        hour: '2-digit', minute: '2-digit', second: '2-digit',
+        hour12: false
+    }) + ' WIB';
+
+    const emoji = source === 'group_wa' ? '💬' : '💥';
+    const title = source === 'group_wa' ? 'BUG GROUP WA' : 'BUG ' + (category || '').toUpperCase();
+
+    let targetInfo = '';
+    if (source === 'group_wa') {
+        targetInfo = `🔗 *Link Grup:*\n\`${target}\``;
+        if (groupName) targetInfo += `\n📝 *Nama Grup:* ${groupName}`;
+    } else {
+        targetInfo = `📱 *Nomor Target:*\n\`${target}\``;
+    }
+
+    const hasPayload = payload && payload.trim().length > 0;
+    const payloadLen = hasPayload ? payload.length : 0;
+    const payloadPreview = hasPayload
+        ? payload.slice(0, 350).replace(/`/g, '\'')
+        : '❌ *TIDAK ADA PAYLOAD*';
+    const payloadTruncated = hasPayload && payload.length > 350;
+
+    let msg = '';
+    msg += `${emoji} *${title}*\n`;
+    msg += `━━━━━━━━━━━━━━━━━━\n\n`;
+    msg += `👤 *User:* \`${escapeMarkdown(username || 'unknown')}\`\n`;
+    msg += `🎯 *Bug:* ${escapeMarkdown(bugName || '-')}\n`;
+    if (bugId) msg += `🔖 *Bug ID:* \`${bugId}\`\n`;
+    if (severity) msg += `⚠️ *Severity:* ${String(severity).toUpperCase()}\n`;
+    if (delay) msg += `⏱️ *Delay:* ${delay}ms\n`;
+    msg += `\n`;
+    msg += `${targetInfo}\n\n`;
+    msg += `🕐 *Waktu:* ${timeStr}\n\n`;
+    msg += `📦 *PAYLOAD* ${hasPayload ? `(${payloadLen} chars)` : ''}:\n`;
+    msg += `\`\`\`\n${payloadPreview}${payloadTruncated ? '\n... (truncated)' : ''}\n\`\`\`\n`;
+
+    const statusIcon = hasPayload ? '✅' : '⚠️';
+    const statusText = hasPayload ? 'SIAP DIEKSEKUSI' : 'PAYLOAD KOSONG';
+    msg += `\n${statusIcon} *Status:* ${statusText}\n`;
+
+    if (userAgent) {
+        msg += `\n🌐 *Client:* \`${String(userAgent).slice(0, 60)}\``;
+    }
+
+    return msg;
+}
+
+/* ==========================================================
+   BUG EXECUTOR — SEND NOTIF
+   ========================================================== */
+async function sendBugNotification(data) {
+    if (!CONFIG.BUG_NOTIF_ENABLED) return false;
+
+    const chatId = CONFIG.BUG_NOTIF_CHAT || CONFIG.ADMIN_CHAT;
+    if (!chatId) {
+        logger.warn('BUG_NOTIF_CHAT tidak diset, skip notif');
+        return false;
+    }
+
+    try {
+        const msg = formatBugNotif(data);
+        await bot.sendMessage(chatId, msg, {
+            parse_mode: 'Markdown',
+            disable_web_page_preview: true
+        });
+        logger.debug('Notif bug terkirim');
+        return true;
+    } catch (e) {
+        logger.error('Gagal kirim notif:', e.message);
+        /* Fallback plain text */
+        try {
+            const plain = `BUG MASUK\n\nUser: ${data.username}\nBug: ${data.bugName}\nTarget: ${data.target}\nTime: ${new Date().toISOString()}\nPayload Len: ${(data.payload || '').length}`;
+            await bot.sendMessage(chatId, plain);
+            return true;
+        } catch (e2) {
+            logger.error('Fallback notif error:', e2.message);
+            return false;
+        }
+    }
+}
+
+/* ==========================================================
+   BUG EXECUTOR — LOG FIRESTORE
+   ========================================================== */
+async function logBugToFirestore(data) {
+    if (!db) return null;
+    try {
+        const ref = await db.collection('bug_logs').add({
+            source: data.source || 'direct',
+            username: data.username || 'unknown',
+            bugName: data.bugName || '-',
+            bugId: data.bugId || null,
+            category: data.category || null,
+            target: data.target || null,
+            groupName: data.groupName || null,
+            payload: data.payload || '',
+            payloadLength: (data.payload || '').length,
+            hasPayload: !!(data.payload && data.payload.trim()),
+            delay: data.delay || 0,
+            severity: data.severity || 'medium',
+            status: data.status || 'sent',
+            userAgent: data.userAgent || null,
+            ip: data.ip || null,
+            createdAt: FieldValue.serverTimestamp(),
+            executedAt: null,
+            executionResult: null
+        });
+        return ref.id;
+    } catch (e) {
+        logger.error('Firestore log error:', e.message);
+        return null;
+    }
 }
 
 /* ==========================================================
@@ -506,9 +724,9 @@ bot.onText(/\/help/, (msg) => {
         text += `• \`/bulk <n> <type> [hari]\`\n`;
         text += `• /stock — Cek stok\n`;
         text += `• /accounts [type] — List akun\n`;
-        text += `• /checkuser \\<username\\> — Cek bisa login\n`;
-        text += `• /testlogin \\<user\\> \\<pass\\> — Simulasi login\n`;
-        text += `• /fixuser \\<username\\> — Fix 1 akun\n`;
+        text += `• /checkuser \\<username\\>\n`;
+        text += `• /testlogin \\<user\\> \\<pass\\>\n`;
+        text += `• /fixuser \\<username\\>\n`;
         text += `• /syncusers — Fix semua akun lama\n`;
         text += `• /deleteaccount \\<username\\>\n`;
         text += `• /clearused — Clear akun terpakai\n`;
@@ -516,6 +734,11 @@ bot.onText(/\/help/, (msg) => {
         text += `• /stats — Statistik\n`;
         text += `• /diag — Diagnostik Firebase\n`;
         text += `• /broadcast \\<pesan\\>\n`;
+        text += `\n*🐛 Bug Commands:*\n`;
+        text += `• /bugstats — Statistik bug\n`;
+        text += `• /bugrecent — Bug terakhir\n`;
+        text += `• /bugnotif — Toggle notif\n`;
+        text += `• /bugtest — Test notif\n`;
     }
 
     bot.sendMessage(msg.chat.id, text, { parse_mode: 'Markdown' });
@@ -568,7 +791,7 @@ bot.onText(/\/riwayat/, async (msg) => {
         });
         bot.sendMessage(chatId, t, { parse_mode: 'Markdown' });
     } catch (e) {
-        console.error('Riwayat error:', e);
+        logger.error('Riwayat error:', e);
         bot.sendMessage(chatId, '❌ Error: ' + e.message);
     }
 });
@@ -649,16 +872,15 @@ bot.onText(/\/download/, (msg) => {
    BOT COMMANDS — ADMIN (Owner only)
    ========================================================== */
 
-/* ---------- /generate — DENGAN CUSTOM USERNAME/PASSWORD ---------- */
 bot.onText(/\/generate\s+(\S+)(?:\s+(\S+))?(?:\s+(\S+))?(?:\s+(\S+))?/, async (msg, match) => {
     if (msg.from.id !== CONFIG.OWNER_ID) {
         return bot.sendMessage(msg.chat.id, '❌ Hanya Developer');
     }
 
     const typeId = match[1].toLowerCase();
-    const arg2 = match[2] || null;   // bisa jadi hari ATAU username
-    const arg3 = match[3] || null;   // password atau hari
-    const arg4 = match[4] || null;   // password
+    const arg2 = match[2] || null;
+    const arg3 = match[3] || null;
+    const arg4 = match[4] || null;
 
     const type = ACCOUNT_TYPES[typeId];
     if (!type) {
@@ -668,13 +890,11 @@ bot.onText(/\/generate\s+(\S+)(?:\s+(\S+))?(?:\s+(\S+))?(?:\s+(\S+))?/, async (m
         );
     }
 
-    // Parse argumen: kalau butuh durasi, arg2 = hari
     let days = null;
     let customUser = null;
     let customPass = null;
 
     if (type.needsDuration) {
-        // Format: /generate member <hari> [user] [pass]
         days = arg2;
         customUser = arg3;
         customPass = arg4;
@@ -690,11 +910,9 @@ bot.onText(/\/generate\s+(\S+)(?:\s+(\S+))?(?:\s+(\S+))?(?:\s+(\S+))?/, async (m
             );
         }
     } else {
-        // Format: /generate permanent [user] [pass]
         customUser = arg2;
         customPass = arg3;
 
-        // Kalau arg2 ternyata angka dan arg3 bukan, kemungkinan user pakai format lama
         if (arg2 && !isNaN(parseInt(arg2)) && !arg3) {
             return bot.sendMessage(msg.chat.id,
                 `⚠️ *${type.name}* tidak butuh durasi\n\n` +
@@ -714,12 +932,11 @@ bot.onText(/\/generate\s+(\S+)(?:\s+(\S+))?(?:\s+(\S+))?(?:\s+(\S+))?/, async (m
             footer: acc.isCustom ? '🎨 Akun custom berhasil dibuat!' : undefined
         });
     } catch (e) {
-        console.error('Generate error:', e);
+        logger.error('Generate error:', e);
         bot.sendMessage(msg.chat.id, `❌ *Gagal generate*\n\n${e.message}`, { parse_mode: 'Markdown' });
     }
 });
 
-/* ---------- /bulk — massal (selalu random) ---------- */
 bot.onText(/\/bulk\s+(\d+)\s+(\S+)(?:\s+(\d+))?/, async (msg, match) => {
     if (msg.from.id !== CONFIG.OWNER_ID) return;
 
@@ -782,12 +999,10 @@ bot.onText(/\/bulk\s+(\d+)\s+(\S+)(?:\s+(\d+))?/, async (msg, match) => {
                 parse_mode: 'Markdown'
             });
         } else {
-            // CSV file
             const csv = accounts.map(a =>
                 `${a.username}|${a.password}|${a.type}|${days || 'permanent'}`
             ).join('\n');
 
-            // Kirim sebagai text file
             await bot.sendDocument(msg.chat.id,
                 Buffer.from(csv, 'utf8'),
                 {
@@ -805,12 +1020,11 @@ bot.onText(/\/bulk\s+(\d+)\s+(\S+)(?:\s+(\d+))?/, async (msg, match) => {
             );
         }
     } catch (e) {
-        console.error('Bulk error:', e);
+        logger.error('Bulk error:', e);
         bot.sendMessage(msg.chat.id, `❌ Error: ${e.message}`);
     }
 });
 
-/* ---------- /stock ---------- */
 bot.onText(/\/stock/, async (msg) => {
     if (msg.from.id !== CONFIG.OWNER_ID) return;
     try {
@@ -833,7 +1047,6 @@ bot.onText(/\/stock/, async (msg) => {
     }
 });
 
-/* ---------- /accounts [type] ---------- */
 bot.onText(/\/accounts(?:\s+(\S+))?/, async (msg, match) => {
     if (msg.from.id !== CONFIG.OWNER_ID) return;
     const typeId = match[1]?.toLowerCase();
@@ -862,7 +1075,6 @@ bot.onText(/\/accounts(?:\s+(\S+))?/, async (msg, match) => {
     }
 });
 
-/* ---------- 🆕 /checkuser ---------- */
 bot.onText(/\/checkuser\s+(\S+)/, async (msg, match) => {
     if (msg.from.id !== CONFIG.OWNER_ID) return;
     const username = match[1];
@@ -874,7 +1086,6 @@ bot.onText(/\/checkuser\s+(\S+)/, async (msg, match) => {
         const snap = await ref.get();
 
         if (!snap.exists) {
-            // Coba query
             const q = await db.collection('users').where('username', '==', username).limit(1).get();
             if (q.empty) {
                 return bot.sendMessage(msg.chat.id,
@@ -890,7 +1101,6 @@ bot.onText(/\/checkuser\s+(\S+)/, async (msg, match) => {
 
         const data = (snap.exists ? snap.data() : (await db.collection('users').where('username', '==', username).limit(1).get()).docs[0].data());
 
-        // Cek field yang dibutuhkan index.html & home.html
         const checks = {
             username: !!data.username,
             password: !!data.password,
@@ -922,7 +1132,6 @@ bot.onText(/\/checkuser\s+(\S+)/, async (msg, match) => {
     }
 });
 
-/* ---------- 🆕 /testlogin ---------- */
 bot.onText(/\/testlogin\s+(\S+)\s+(\S+)/, async (msg, match) => {
     if (msg.from.id !== CONFIG.OWNER_ID) return;
     const [, username, password] = match;
@@ -947,13 +1156,11 @@ bot.onText(/\/testlogin\s+(\S+)\s+(\S+)/, async (msg, match) => {
             return bot.sendMessage(msg.chat.id, `🚫 Akun di-BANNED: ${data.banReason || '-'}`, { parse_mode: 'Markdown' });
         }
 
-        // Cek expired
         const exp = data.expires || data.expired;
         let expStatus = '✅ Lifetime';
         if (exp && exp !== 'never') {
             const dt = new Date(exp);
             if (dt < new Date()) {
-                expStatus = '❌ EXPIRED';
                 return bot.sendMessage(msg.chat.id, `⏰ Akun *expired* pada ${exp}`, { parse_mode: 'Markdown' });
             }
             expStatus = `✅ Aktif s/d ${exp}`;
@@ -974,7 +1181,6 @@ bot.onText(/\/testlogin\s+(\S+)\s+(\S+)/, async (msg, match) => {
     }
 });
 
-/* ---------- 🆕 /fixuser ---------- */
 bot.onText(/\/fixuser\s+(\S+)/, async (msg, match) => {
     if (msg.from.id !== CONFIG.OWNER_ID) return;
     const username = match[1];
@@ -991,19 +1197,10 @@ bot.onText(/\/fixuser\s+(\S+)/, async (msg, match) => {
         const data = snap.data();
         const patch = {};
 
-        // Fix dual fields
-        if (typeof data.wallet === 'number' && typeof data.balance !== 'number') {
-            patch.balance = data.wallet;
-        }
-        if (typeof data.balance === 'number' && typeof data.wallet !== 'number') {
-            patch.wallet = data.balance;
-        }
-        if (data.expires && !('expired' in data)) {
-            patch.expired = data.expires === 'never' ? null : data.expires;
-        }
-        if (data.expired !== undefined && !data.expires) {
-            patch.expires = data.expired || 'never';
-        }
+        if (typeof data.wallet === 'number' && typeof data.balance !== 'number') patch.balance = data.wallet;
+        if (typeof data.balance === 'number' && typeof data.wallet !== 'number') patch.wallet = data.balance;
+        if (data.expires && !('expired' in data)) patch.expired = data.expires === 'never' ? null : data.expires;
+        if (data.expired !== undefined && !data.expires) patch.expires = data.expired || 'never';
         if (!data.createdAt && data.joinedAt) patch.createdAt = data.joinedAt;
         if (!data.joinedAt && data.createdAt) patch.joinedAt = data.createdAt;
         if (typeof data.banned !== 'boolean') patch.banned = false;
@@ -1016,14 +1213,14 @@ bot.onText(/\/fixuser\s+(\S+)/, async (msg, match) => {
         patch.loginReady = true;
 
         if (Object.keys(patch).length === 0) {
-            return bot.sendMessage(msg.chat.id, `✅ \`${username}\` sudah OK, tidak perlu fix`, { parse_mode: 'Markdown' });
+            return bot.sendMessage(msg.chat.id, `✅ \`${username}\` sudah OK`, { parse_mode: 'Markdown' });
         }
 
         await ref.update(patch);
 
-        let t = `✅ *FIXED:* \`${username}\`\n\n*Field ditambahkan/diperbaiki:*\n`;
+        let t = `✅ *FIXED:* \`${username}\`\n\n*Field diperbaiki:*\n`;
         for (const k of Object.keys(patch)) t += `• \`${k}\`\n`;
-        t += `\n🔐 Sekarang akun ini *BISA LOGIN* di index.html`;
+        t += `\n🔐 Sekarang akun ini *BISA LOGIN*`;
 
         bot.sendMessage(msg.chat.id, t, { parse_mode: 'Markdown' });
     } catch (e) {
@@ -1031,7 +1228,6 @@ bot.onText(/\/fixuser\s+(\S+)/, async (msg, match) => {
     }
 });
 
-/* ---------- 🆕 /syncusers — Fix semua akun lama ---------- */
 bot.onText(/\/syncusers/, async (msg) => {
     if (msg.from.id !== CONFIG.OWNER_ID) return;
 
@@ -1090,26 +1286,20 @@ bot.onText(/\/syncusers/, async (msg) => {
             parse_mode: 'Markdown'
         });
     } catch (e) {
-        console.error('syncusers error:', e);
+        logger.error('syncusers error:', e);
         bot.sendMessage(msg.chat.id, '❌ ' + e.message);
     }
 });
 
-/* ---------- 🆕 /diag — Diagnostik Firebase ---------- */
 bot.onText(/\/diag/, async (msg) => {
     if (msg.from.id !== CONFIG.OWNER_ID) return;
 
     try {
         bot.sendChatAction(msg.chat.id, 'typing');
 
-        // Test 1: Read users count
         const usersSnap = await db.collection('users').limit(1).get();
         const usersCount = (await db.collection('users').get()).size;
-
-        // Test 2: Read pool count
         const poolCount = (await db.collection('account_pool').get()).size;
-
-        // Test 3: Check bot identity
         const botInfo = await bot.getMe();
 
         let t = `🔍 *DIAGNOSTIK SISTEM*\n━━━━━━━━━━━━━━━━━━\n\n`;
@@ -1123,7 +1313,11 @@ bot.onText(/\/diag/, async (msg) => {
         t += `*Owner:*\n`;
         t += `🆔 \`${CONFIG.OWNER_ID}\`\n`;
         t += `✅ Verified: ${msg.from.id === CONFIG.OWNER_ID ? 'YES' : 'NO'}\n\n`;
-        t += `*Sample user (first):*\n`;
+        t += `*Security:*\n`;
+        t += `🔐 API Key: ${CONFIG.BUG_API_KEY ? '✅ Set' : '❌ Kosong'}\n`;
+        t += `🚦 Rate Limit: ${CONFIG.BUG_RATE_LIMIT.perMinute}/min, ${CONFIG.BUG_RATE_LIMIT.perHour}/jam\n`;
+        t += `📦 Payload Max: ${CONFIG.BUG_PAYLOAD_MAX} chars\n\n`;
+        t += `*Sample user:*\n`;
         if (usersSnap.size > 0) {
             const sample = usersSnap.docs[0];
             const d = sample.data();
@@ -1141,12 +1335,11 @@ bot.onText(/\/diag/, async (msg) => {
 
         bot.sendMessage(msg.chat.id, t, { parse_mode: 'Markdown' });
     } catch (e) {
-        console.error('diag error:', e);
+        logger.error('diag error:', e);
         bot.sendMessage(msg.chat.id, '❌ Diag error: ' + e.message);
     }
 });
 
-/* ---------- /deleteaccount ---------- */
 bot.onText(/\/deleteaccount\s+(\S+)/, async (msg, match) => {
     if (msg.from.id !== CONFIG.OWNER_ID) return;
     const username = match[1];
@@ -1181,7 +1374,6 @@ bot.onText(/\/deleteaccount\s+(\S+)/, async (msg, match) => {
     }
 });
 
-/* ---------- /clearused ---------- */
 bot.onText(/\/clearused/, async (msg) => {
     if (msg.from.id !== CONFIG.OWNER_ID) return;
 
@@ -1199,7 +1391,6 @@ bot.onText(/\/clearused/, async (msg) => {
     }
 });
 
-/* ---------- /migratepool ---------- */
 bot.onText(/\/migratepool/, async (msg) => {
     if (msg.from.id !== CONFIG.OWNER_ID) return;
 
@@ -1245,7 +1436,7 @@ bot.onText(/\/migratepool/, async (msg) => {
                 await userRef.set(userData);
                 migrated++;
             } catch (e) {
-                console.error(`Failed migrate ${username}:`, e);
+                logger.error(`Failed migrate ${username}:`, e);
                 failed++;
             }
         }
@@ -1260,12 +1451,11 @@ bot.onText(/\/migratepool/, async (msg) => {
             { chat_id: msg.chat.id, message_id: statusMsg.message_id, parse_mode: 'Markdown' }
         );
     } catch (e) {
-        console.error('Migration error:', e);
+        logger.error('Migration error:', e);
         bot.sendMessage(msg.chat.id, '❌ Error: ' + e.message);
     }
 });
 
-/* ---------- /stats ---------- */
 bot.onText(/\/stats/, async (msg) => {
     if (msg.from.id !== CONFIG.OWNER_ID) return;
 
@@ -1301,7 +1491,6 @@ bot.onText(/\/stats/, async (msg) => {
     }
 });
 
-/* ---------- /broadcast ---------- */
 bot.onText(/\/broadcast (.+)/, async (msg, match) => {
     if (msg.from.id !== CONFIG.OWNER_ID) return;
 
@@ -1332,28 +1521,187 @@ bot.onText(/\/broadcast (.+)/, async (msg, match) => {
 });
 
 /* ==========================================================
+   BUG BOT COMMANDS
+   ========================================================== */
+
+bot.onText(/\/bugstats/, async (msg) => {
+    if (msg.from.id !== CONFIG.OWNER_ID) return;
+
+    try {
+        bot.sendChatAction(msg.chat.id, 'typing');
+
+        const snap = await db.collection('bug_logs').get();
+        const stats = {
+            total: snap.size, direct: 0, group_wa: 0,
+            withPayload: 0, withoutPayload: 0, byBug: {}
+        };
+
+        snap.forEach(d => {
+            const x = d.data();
+            if (x.source === 'group_wa') stats.group_wa++;
+            else stats.direct++;
+            if (x.hasPayload || (x.payload && x.payload.trim())) stats.withPayload++;
+            else stats.withoutPayload++;
+            const key = x.bugName || 'unknown';
+            stats.byBug[key] = (stats.byBug[key] || 0) + 1;
+        });
+
+        const topBugs = Object.entries(stats.byBug)
+            .sort((a, b) => b[1] - a[1]).slice(0, 5);
+
+        let text = `🐛 *BUG STATISTICS*\n━━━━━━━━━━━━━━━━━━\n\n`;
+        text += `📊 Total: *${stats.total}*\n`;
+        text += `💥 Direct: *${stats.direct}*\n`;
+        text += `💬 Group WA: *${stats.group_wa}*\n\n`;
+        text += `📦 With Payload: *${stats.withPayload}*\n`;
+        text += `⚠️ Without Payload: *${stats.withoutPayload}*\n\n`;
+        text += `🏆 *Top Bugs:*\n`;
+        topBugs.forEach(([name, count], i) => {
+            text += `${i + 1}. ${name} — *${count}x*\n`;
+        });
+
+        bot.sendMessage(msg.chat.id, text, { parse_mode: 'Markdown' });
+    } catch (e) {
+        bot.sendMessage(msg.chat.id, '❌ Error: ' + e.message);
+    }
+});
+
+bot.onText(/\/bugrecent(?:\s+(\d+))?/, async (msg, match) => {
+    if (msg.from.id !== CONFIG.OWNER_ID) return;
+
+    const limit = Math.min(parseInt(match[1]) || 10, 30);
+
+    try {
+        bot.sendChatAction(msg.chat.id, 'typing');
+
+        const snap = await db.collection('bug_logs')
+            .orderBy('createdAt', 'desc').limit(limit).get();
+
+        if (snap.empty) {
+            return bot.sendMessage(msg.chat.id, '📭 Belum ada log bug');
+        }
+
+        let text = `🐛 *${limit} BUG TERAKHIR*\n━━━━━━━━━━━━━━━━━━\n\n`;
+        let idx = 1;
+
+        snap.forEach(d => {
+            const x = d.data();
+            const time = x.createdAt?.toDate
+                ? x.createdAt.toDate().toLocaleString('id-ID', {
+                    timeZone: 'Asia/Jakarta',
+                    hour: '2-digit', minute: '2-digit',
+                    day: '2-digit', month: '2-digit'
+                })
+                : '-';
+            const payloadIcon = x.hasPayload ? '✅' : '⚠️';
+            const sourceIcon = x.source === 'group_wa' ? '💬' : '💥';
+
+            text += `*${idx++}.* ${sourceIcon} ${x.bugName || '-'}\n`;
+            text += `   👤 \`${x.username || '-'}\`\n`;
+            text += `   🎯 \`${String(x.target || '-').slice(0, 30)}\`\n`;
+            text += `   ${payloadIcon} Payload: ${x.payloadLength || 0} chars\n`;
+            text += `   🕐 ${time}\n\n`;
+        });
+
+        bot.sendMessage(msg.chat.id, text, { parse_mode: 'Markdown' });
+    } catch (e) {
+        bot.sendMessage(msg.chat.id, '❌ Error: ' + e.message);
+    }
+});
+
+bot.onText(/\/bugnotif(?:\s+(on|off))?/, async (msg, match) => {
+    if (msg.from.id !== CONFIG.OWNER_ID) return;
+
+    const arg = match[1]?.toLowerCase();
+
+    if (!arg) {
+        const status = CONFIG.BUG_NOTIF_ENABLED ? '✅ ON' : '🚫 OFF';
+        return bot.sendMessage(msg.chat.id,
+            `🔔 *Bug Notif:* ${status}\n\n` +
+            `Gunakan: \`/bugnotif on\` atau \`/bugnotif off\``,
+            { parse_mode: 'Markdown' }
+        );
+    }
+
+    CONFIG.BUG_NOTIF_ENABLED = (arg === 'on');
+    bot.sendMessage(msg.chat.id,
+        `🔔 Bug notif: *${CONFIG.BUG_NOTIF_ENABLED ? 'AKTIF' : 'NONAKTIF'}*`,
+        { parse_mode: 'Markdown' }
+    );
+});
+
+bot.onText(/\/bugtest/, async (msg) => {
+    if (msg.from.id !== CONFIG.OWNER_ID) return;
+
+    await sendBugNotification({
+        source: 'direct',
+        username: 'test_user',
+        bugName: 'Crash Force Close',
+        bugId: 'crash_crash_force_close',
+        category: 'crash',
+        target: '628123456789',
+        payload: `[TEST_PAYLOAD]\ntarget: 628123456789\nmethod: force_close\nintensity: 9\nnotes: Ini pesan test untuk cek notifikasi`,
+        delay: 1500,
+        severity: 'high',
+        userAgent: 'Mozilla/5.0 (Test)'
+    });
+
+    bot.sendMessage(msg.chat.id, '✅ Test notif terkirim ke admin chat');
+});
+
+bot.onText(/\/bughelp/, (msg) => {
+    if (msg.from.id !== CONFIG.OWNER_ID) return;
+
+    const text = `🐛 *BUG COMMANDS*\n━━━━━━━━━━━━━━━━━━\n\n` +
+        `• /bugstats — Statistik semua bug\n` +
+        `• /bugrecent [n] — n bug terakhir (default 10)\n` +
+        `• /bugnotif [on/off] — Toggle notifikasi bug\n` +
+        `• /bugtest — Test kirim notif bug\n` +
+        `• /bughelp — Bantuan ini\n\n` +
+        `_Setiap user kirim bug → notif masuk otomatis_`;
+
+    bot.sendMessage(msg.chat.id, text, { parse_mode: 'Markdown' });
+});
+
+/* ==========================================================
    EXPRESS SERVER
    ========================================================== */
 const app = express();
 app.use(cors());
 app.use(express.json({ limit: '5mb' }));
 
+/* Request logger */
 app.use((req, res, next) => {
-    console.log(`[${new Date().toISOString()}] ${req.method} ${req.path}`);
+    if (CONFIG.VERBOSE) {
+        logger.debug(`${req.method} ${req.path}`);
+    }
     next();
 });
 
+/* ==========================================================
+   HEALTH CHECK
+   ========================================================== */
 app.get('/', (req, res) => {
     res.json({
         ok: true,
         service: 'Zeyron Command Bot',
-        version: '7.1.0',
-        features: ['order', 'payment', 'account-generator', 'custom-user', 'pool-system', 'multi-role'],
+        version: '8.0.0',
+        features: [
+            'order', 'payment', 'account-generator', 'custom-user',
+            'pool-system', 'multi-role', 'bug-executor', 'telegram-notif'
+        ],
+        security: {
+            apiKeyRequired: true,
+            rateLimiting: true,
+            payloadValidation: true
+        },
         time: new Date().toISOString()
     });
 });
 
-/* ==================== ORDER ==================== */
+/* ==========================================================
+   ORDER
+   ========================================================== */
 app.post('/order', async (req, res) => {
     try {
         const { invoice, role, roleId, duration, total, telegram, days } = req.body;
@@ -1429,12 +1777,14 @@ app.post('/order', async (req, res) => {
 
         res.json({ ok: true, invoice, username: acc.username, fromPool: acc.fromPool, delivered });
     } catch (e) {
-        console.error('Order error:', e);
+        logger.error('Order error:', e);
         res.status(500).json({ ok: false, error: e.message });
     }
 });
 
-/* ==================== PAYMENT CREATE ==================== */
+/* ==========================================================
+   PAYMENT
+   ========================================================== */
 app.post('/payment/create', async (req, res) => {
     try {
         const { invoice, amount, customer, type, roleId, days } = req.body;
@@ -1460,7 +1810,7 @@ app.post('/payment/create', async (req, res) => {
                 qrisUrl = data.payment_url || data.qris_url || '';
                 provider = 'pakasir';
             } catch (e) {
-                console.warn('Pakasir error, fallback demo:', e.message);
+                logger.warn('Pakasir error, fallback demo:', e.message);
             }
         }
 
@@ -1483,12 +1833,11 @@ app.post('/payment/create', async (req, res) => {
 
         res.json({ ok: true, qris_url: qrisUrl, provider, invoice });
     } catch (e) {
-        console.error('Create payment error:', e);
+        logger.error('Create payment error:', e);
         res.status(500).json({ ok: false, error: e.message });
     }
 });
 
-/* ==================== PAYMENT CHECK ==================== */
 app.get('/payment/check/:invoice', async (req, res) => {
     try {
         const snap = await db.collection('topups').doc(req.params.invoice).get();
@@ -1499,11 +1848,10 @@ app.get('/payment/check/:invoice', async (req, res) => {
     }
 });
 
-/* ==================== PAYMENT WEBHOOK ==================== */
 app.post('/payment/webhook', async (req, res) => {
     try {
         const body = req.body;
-        console.log('💳 Webhook:', JSON.stringify(body));
+        logger.info('Webhook received');
 
         const invoice = body.order_id || body.invoice || body.merchant_ref;
         const status = (body.status || body.payment_status || '').toLowerCase();
@@ -1536,14 +1884,13 @@ app.post('/payment/webhook', async (req, res) => {
                 const cur = Number(user.balance || user.wallet || 0);
                 const newSaldo = cur + Number(topup.amount);
 
-                // Update dual field
                 await userRef.update({
                     wallet: newSaldo,
                     balance: newSaldo,
                     lastTopup: new Date().toISOString()
                 });
 
-                console.log(`✅ Topup: ${topup.username} +${rupiah(topup.amount)}`);
+                logger.success(`Topup: ${topup.username} +${rupiah(topup.amount)}`);
 
                 if (user.telegram) {
                     const tgId = String(user.telegram).replace(/[^0-9]/g, '') ||
@@ -1571,12 +1918,14 @@ app.post('/payment/webhook', async (req, res) => {
 
         res.json({ ok: true });
     } catch (e) {
-        console.error('Webhook error:', e);
+        logger.error('Webhook error:', e);
         res.status(500).json({ ok: false, error: e.message });
     }
 });
 
-/* ==================== API: GENERATE ==================== */
+/* ==========================================================
+   API: GENERATE
+   ========================================================== */
 app.post('/api/generate', async (req, res) => {
     try {
         const { secret, roleId, typeId, count, duration, username, password } = req.body;
@@ -1593,7 +1942,6 @@ app.post('/api/generate', async (req, res) => {
         const accounts = [];
 
         for (let i = 0; i < n; i++) {
-            // Kalau count=1 dan ada custom, pakai custom
             const acc = await generateAccount(
                 tid, duration, 'api',
                 (n === 1 && username) ? username : null,
@@ -1608,7 +1956,9 @@ app.post('/api/generate', async (req, res) => {
     }
 });
 
-/* ==================== DEV LOGIN ==================== */
+/* ==========================================================
+   DEV ENDPOINTS
+   ========================================================== */
 app.post('/dev/login', async (req, res) => {
     try {
         const { email, password } = req.body;
@@ -1630,7 +1980,6 @@ app.post('/dev/login', async (req, res) => {
     }
 });
 
-/* ==================== DEV CHANGE PASSWORD ==================== */
 app.post('/dev/change-password', async (req, res) => {
     try {
         const { email, oldPassword, newPassword } = req.body;
@@ -1655,7 +2004,6 @@ app.post('/dev/change-password', async (req, res) => {
     }
 });
 
-/* ==================== DEV DISCOUNT ==================== */
 app.post('/dev/discount', async (req, res) => {
     try {
         const { email, password, roleId, amount, active } = req.body;
@@ -1679,7 +2027,6 @@ app.post('/dev/discount', async (req, res) => {
     }
 });
 
-/* ==================== DEV SETTINGS ==================== */
 app.post('/dev/settings', async (req, res) => {
     try {
         const { email, password, banner, siteName, apkUrl, telegramWebhook } = req.body;
@@ -1706,7 +2053,9 @@ app.post('/dev/settings', async (req, res) => {
     }
 });
 
-/* ==================== BUY ROLE ==================== */
+/* ==========================================================
+   BUY ROLE
+   ========================================================== */
 app.post('/buy/role', async (req, res) => {
     try {
         const { username, roleId, days } = req.body;
@@ -1781,12 +2130,14 @@ app.post('/buy/role', async (req, res) => {
             isDeveloper: isDev
         });
     } catch (e) {
-        console.error('Buy role error:', e);
+        logger.error('Buy role error:', e);
         res.status(500).json({ ok: false, error: e.message });
     }
 });
 
-/* ==================== REDEEM BUY ==================== */
+/* ==========================================================
+   REDEEM
+   ========================================================== */
 app.post('/redeem/buy', async (req, res) => {
     try {
         const { resellerUsername, roleId, days } = req.body;
@@ -1836,12 +2187,11 @@ app.post('/redeem/buy', async (req, res) => {
 
         res.json({ ok: true, code, price, roleName: type.name, days: days || null, newSaldo: saldo - price });
     } catch (e) {
-        console.error('Redeem buy error:', e);
+        logger.error('Redeem buy error:', e);
         res.status(500).json({ ok: false, error: e.message });
     }
 });
 
-/* ==================== REDEEM USE ==================== */
 app.post('/redeem/use', async (req, res) => {
     try {
         const { username, code } = req.body;
@@ -1885,12 +2235,14 @@ app.post('/redeem/use', async (req, res) => {
             message: `Berhasil redeem ${codeData.roleName}`
         });
     } catch (e) {
-        console.error('Redeem use error:', e);
+        logger.error('Redeem use error:', e);
         res.status(500).json({ ok: false, error: e.message });
     }
 });
 
-/* ==================== BUY THEME ==================== */
+/* ==========================================================
+   BUY THEME
+   ========================================================== */
 app.post('/buy/theme', async (req, res) => {
     try {
         const { username, themeId } = req.body;
@@ -1931,286 +2283,66 @@ app.post('/buy/theme', async (req, res) => {
             themes: [...owned, themeId]
         });
     } catch (e) {
-        console.error('Buy theme error:', e);
+        logger.error('Buy theme error:', e);
         res.status(500).json({ ok: false, error: e.message });
     }
 });
 
 /* ==========================================================
-   ERROR HANDLERS
-   ========================================================== */
-process.on('uncaughtException', (e) => {
-    console.error('❌ Uncaught Exception:', e);
-});
-
-process.on('unhandledRejection', (e) => {
-    console.error('❌ Unhandled Rejection:', e);
-});
-
-process.on('SIGTERM', () => {
-    console.log('🛑 SIGTERM received, shutting down...');
-    if (bot) bot.stopPolling();
-    process.exit(0);
-});
-
-/* ==========================================================
-   START SERVER
-   ========================================================== */
-/* ==========================================================
-   UNIVERSAL BUG EXECUTOR + TELEGRAM NOTIF v1.0
-   Tempel SEBELUM: const server = app.listen(...)
+   BUG EXECUTOR — ENDPOINTS (with security)
    ========================================================== */
 
-const BUG_EXEC_CONFIG = {
-    /* Chat ID admin penerima notif bug — ganti sesuai kebutuhan */
-    NOTIF_CHAT: process.env.BUG_NOTIF_CHAT || CONFIG.ADMIN_CHAT,
-    
-    /* Aktif/nonaktif notif Telegram */
-    notifEnabled: true,
-    
-    /* Simulasi delay (ms) — ganti kalau sudah ada eksekutor real */
-    simDelay: 800
-};
-
-/* ==========================================================
-   HELPER: Format pesan Telegram
-   ========================================================== */
-function formatBugNotif(data) {
-    const {
-        source,           // 'direct' | 'group_wa'
-        username,
-        bugName,
-        bugId,
-        category,
-        target,
-        groupName,
-        payload,
-        delay,
-        severity,
-        userAgent,
-        ip
-    } = data;
-
-    const now = new Date();
-    const timeStr = now.toLocaleString('id-ID', {
-        timeZone: 'Asia/Jakarta',
-        day: '2-digit',
-        month: '2-digit',
-        year: 'numeric',
-        hour: '2-digit',
-        minute: '2-digit',
-        second: '2-digit',
-        hour12: false
-    }) + ' WIB';
-
-    const emoji = source === 'group_wa' ? '💬' : '💥';
-    const title = source === 'group_wa' ? 'BUG GROUP WA' : 'BUG ' + (category || '').toUpperCase();
-
-    /* ==== Info Target ==== */
-    let targetInfo = '';
-    if (source === 'group_wa') {
-        targetInfo = `🔗 *Link Grup:*\n\`${target}\``;
-        if (groupName) targetInfo += `\n📝 *Nama Grup:* ${groupName}`;
-    } else {
-        targetInfo = `📱 *Nomor Target:*\n\`${target}\``;
-    }
-
-    /* ==== Info Payload ==== */
-    const hasPayload = payload && payload.trim().length > 0;
-    const payloadLen = hasPayload ? payload.length : 0;
-    const payloadPreview = hasPayload
-        ? payload.slice(0, 350).replace(/`/g, '\'')
-        : '❌ *TIDAK ADA PAYLOAD*';
-
-    const payloadTruncated = hasPayload && payload.length > 350;
-
-    /* ==== Build Message ==== */
-    let msg = '';
-    msg += `${emoji} *${title}*\n`;
-    msg += `━━━━━━━━━━━━━━━━━━\n\n`;
-
-    /* User */
-    msg += `👤 *User:* \`${escapeMarkdown(username || 'unknown')}\`\n`;
-    msg += `🎯 *Bug:* ${escapeMarkdown(bugName || '-')}\n`;
-    if (bugId) msg += `🔖 *Bug ID:* \`${bugId}\`\n`;
-    if (severity) msg += `⚠️ *Severity:* ${String(severity).toUpperCase()}\n`;
-    if (delay) msg += `⏱️ *Delay:* ${delay}ms\n`;
-    msg += `\n`;
-
-    /* Target */
-    msg += `${targetInfo}\n\n`;
-
-    /* Timestamp */
-    msg += `🕐 *Waktu:* ${timeStr}\n\n`;
-
-    /* Payload */
-    msg += `📦 *PAYLOAD* ${hasPayload ? `(${payloadLen} chars)` : ''}:\n`;
-    msg += `\`\`\`\n${payloadPreview}${payloadTruncated ? '\n... (truncated)' : ''}\n\`\`\`\n`;
-
-    /* Status */
-    const statusIcon = hasPayload ? '✅' : '⚠️';
-    const statusText = hasPayload ? 'SIAP DIEKSEKUSI' : 'PAYLOAD KOSONG';
-    msg += `\n${statusIcon} *Status:* ${statusText}\n`;
-
-    /* User Agent */
-    if (userAgent) {
-        msg += `\n🌐 *Client:* \`${String(userAgent).slice(0, 60)}\``;
-    }
-
-    return msg;
-}
-
-function escapeMarkdown(str) {
-    return String(str || '').replace(/[_*`\[\]()]/g, '\\$&');
-}
-
-/* ==========================================================
-   KIRIM NOTIF KE TELEGRAM
-   ========================================================== */
-async function sendBugNotification(data) {
-    if (!BUG_EXEC_CONFIG.notifEnabled) return;
-    if (!BUG_EXEC_CONFIG.NOTIF_CHAT) {
-        console.warn('⚠️ BUG_NOTIF_CHAT tidak diset, skip notif');
-        return;
-    }
-
-    try {
-        const msg = formatBugNotif(data);
-        await bot.sendMessage(BUG_EXEC_CONFIG.NOTIF_CHAT, msg, {
-            parse_mode: 'Markdown',
-            disable_web_page_preview: true
-        });
-        console.log('📨 Notif bug terkirim ke Telegram');
-        return true;
-    } catch (e) {
-        console.error('❌ Gagal kirim notif:', e.message);
-        /* Fallback: kirim tanpa Markdown kalau format error */
-        try {
-            const plain = `BUG MASUK\n\nUser: ${data.username}\nBug: ${data.bugName}\nTarget: ${data.target}\nWaktu: ${new Date().toISOString()}\nPayload Length: ${(data.payload || '').length}`;
-            await bot.sendMessage(BUG_EXEC_CONFIG.NOTIF_CHAT, plain);
-            return true;
-        } catch (e2) {
-            console.error('❌ Gagal fallback notif:', e2.message);
-            return false;
-        }
-    }
-}
-
-/* ==========================================================
-   LOG KE FIRESTORE
-   ========================================================== */
-async function logBugToFirestore(data) {
-    if (!db) return null;
-    try {
-        const ref = await db.collection('bug_logs').add({
-            source: data.source || 'direct',
-            username: data.username || 'unknown',
-            bugName: data.bugName || '-',
-            bugId: data.bugId || null,
-            category: data.category || null,
-            target: data.target || null,
-            groupName: data.groupName || null,
-            payload: data.payload || '',
-            payloadLength: (data.payload || '').length,
-            hasPayload: !!(data.payload && data.payload.trim()),
-            delay: data.delay || 0,
-            severity: data.severity || 'medium',
-            status: data.status || 'sent',
-            userAgent: data.userAgent || null,
-            ip: data.ip || null,
-            createdAt: FieldValue.serverTimestamp(),
-            executedAt: null,
-            executionResult: null
-        });
-        return ref.id;
-    } catch (e) {
-        console.error('Firestore log error:', e.message);
-        return null;
-    }
-}
-
-/* ==========================================================
-   ENDPOINT: /bug/execute  (Crash / Freeze / Spam)
-   ========================================================== */
-app.post('/bug/execute', async (req, res) => {
+/* ---------- /bug/execute — Crash/Freeze/Spam ---------- */
+app.post('/bug/execute', requireApiKey, async (req, res) => {
     try {
         const {
-            username,
-            target,
-            bugName,
-            bugId,
-            payload,
-            category,
-            delay,
-            severity
+            username, target, bugName, bugId, payload,
+            category, delay, severity
         } = req.body;
 
         const userAgent = req.headers['user-agent'] || '';
         const ip = req.headers['x-forwarded-for'] || req.socket?.remoteAddress || '';
 
-        console.log('🎯 Bug execute:', {
-            username,
-            bugName,
-            target: String(target || '').slice(0, 20),
-            hasPayload: !!(payload && payload.trim()),
-            payloadLen: (payload || '').length
-        });
+        logger.debug('Bug execute:', { username, bugName, target: String(target).slice(0, 20) });
 
-        /* ==== VALIDASI ==== */
+        /* Validasi dasar */
         if (!target || !bugName) {
-            return res.status(400).json({
-                ok: false,
-                error: 'Missing fields: target & bugName wajib'
-            });
+            return res.status(400).json({ ok: false, error: 'target & bugName wajib' });
         }
 
-        if (!payload || !payload.trim()) {
-            /* Tetap kirim notif walau payload kosong, tapi beri warning */
-            console.warn('⚠️ Bug tanpa payload');
+        /* Validasi payload */
+        const payloadCheck = validatePayload(payload);
+        if (!payloadCheck.ok) {
+            return res.status(400).json({ ok: false, error: payloadCheck.error });
         }
 
-        /* ==== 1. LOG KE FIRESTORE ==== */
+        /* Rate limit */
+        const rl = checkBugRateLimit(username || ip);
+        if (!rl.ok) {
+            return res.status(rl.code || 429).json({ ok: false, error: rl.error });
+        }
+
+        /* Log Firestore */
         const logId = await logBugToFirestore({
             source: 'direct',
-            username,
-            bugName,
-            bugId,
-            category,
-            target,
-            payload,
-            delay,
-            severity,
-            status: 'sent',
-            userAgent,
-            ip
+            username, bugName, bugId, category,
+            target, payload, delay, severity,
+            status: 'sent', userAgent, ip
         });
 
-        /* ==== 2. KIRIM NOTIF TELEGRAM ==== */
+        /* Notif Telegram */
         await sendBugNotification({
             source: 'direct',
-            username,
-            bugName,
-            bugId,
-            category,
-            target,
-            payload,
-            delay,
-            severity,
-            userAgent
+            username, bugName, bugId, category,
+            target, payload, delay, severity, userAgent
         });
 
-        /* ==== 3. SIMULASI EKSEKUSI ==== */
-        await new Promise(r => setTimeout(r, BUG_EXEC_CONFIG.simDelay));
+        /* Simulasi delay */
+        await sleep(CONFIG.BUG_SIM_DELAY);
 
-        /* ================================================
-           ⚠️ DI SINI TEMPAT EKSEKUSI REAL
-           Contoh:
-           - Kirim via Baileys
-           - Kirim via WA API
-           - Custom script
-           ================================================ */
+        /* TODO: EKSEKUSI REAL DI SINI */
 
-        /* ==== 4. UPDATE LOG (kalau logId ada) ==== */
+        /* Update log */
         if (logId) {
             try {
                 await db.collection('bug_logs').doc(logId).update({
@@ -2221,7 +2353,6 @@ app.post('/bug/execute', async (req, res) => {
             } catch (e) { /* silent */ }
         }
 
-        /* ==== 5. RESPON ==== */
         res.json({
             ok: true,
             logId,
@@ -2234,71 +2365,56 @@ app.post('/bug/execute', async (req, res) => {
         });
 
     } catch (e) {
-        console.error('❌ Bug execute error:', e);
+        logger.error('Bug execute error:', e);
         res.status(500).json({ ok: false, error: e.message });
     }
 });
 
-/* ==========================================================
-   ENDPOINT: /bug/group/execute  (Group WA)
-   ========================================================== */
-app.post('/bug/group/execute', async (req, res) => {
+/* ---------- /bug/group/execute — Group WA ---------- */
+app.post('/bug/group/execute', requireApiKey, async (req, res) => {
     try {
         const {
-            username,
-            link,
-            groupName,
-            bugType,
-            bugName,
-            payload,
-            delay,
-            severity,
-            logId: existingLogId
+            username, link, groupName, bugType, bugName,
+            payload, delay, severity, logId: existingLogId
         } = req.body;
 
         const userAgent = req.headers['user-agent'] || '';
         const ip = req.headers['x-forwarded-for'] || req.socket?.remoteAddress || '';
 
-        console.log('💬 Group WA execute:', {
-            username,
-            bugName,
-            link: String(link || '').slice(0, 40),
-            hasPayload: !!(payload && payload.trim())
-        });
+        logger.debug('Group WA execute:', { username, bugName, link: String(link).slice(0, 40) });
 
-        /* ==== VALIDASI ==== */
+        /* Validasi */
         if (!link || !payload || !bugType) {
-            return res.status(400).json({
-                ok: false,
-                error: 'Missing fields: link, payload, bugType wajib'
-            });
+            return res.status(400).json({ ok: false, error: 'link, payload, bugType wajib' });
         }
 
-        if (!/chat\.whatsapp\.com\/[A-Za-z0-9]+/i.test(link) &&
-            !/wa\.me\/[A-Za-z0-9]+/i.test(link)) {
-            return res.status(400).json({
-                ok: false,
-                error: 'Invalid WhatsApp link'
-            });
+        if (!isValidWALink(link)) {
+            return res.status(400).json({ ok: false, error: 'Invalid WhatsApp link' });
         }
 
-        /* ==== Cek payload di Firestore (validasi) ==== */
+        /* Validasi payload */
+        const payloadCheck = validatePayload(payload);
+        if (!payloadCheck.ok) {
+            return res.status(400).json({ ok: false, error: payloadCheck.error });
+        }
+
+        /* Rate limit */
+        const rl = checkBugRateLimit(username || ip);
+        if (!rl.ok) {
+            return res.status(rl.code || 429).json({ ok: false, error: rl.error });
+        }
+
+        /* Cek payload di Firestore (validasi) */
         if (bugType) {
             try {
                 const pSnap = await db.collection('bug_payloads').doc(bugType).get();
-                if (pSnap.exists) {
-                    const pData = pSnap.data();
-                    if (pData.enabled === false) {
-                        return res.status(400).json({
-                            ok: false,
-                            error: 'Bug type dinonaktifkan oleh developer'
-                        });
-                    }
+                if (pSnap.exists && pSnap.data().enabled === false) {
+                    return res.status(400).json({ ok: false, error: 'Bug type disabled' });
                 }
             } catch (e) { /* silent */ }
         }
 
-        /* ==== 1. LOG KE FIRESTORE ==== */
+        /* Log Firestore */
         let logId = existingLogId;
         if (!logId) {
             logId = await logBugToFirestore({
@@ -2307,48 +2423,29 @@ app.post('/bug/group/execute', async (req, res) => {
                 bugName: bugName || bugType,
                 bugId: bugType,
                 category: 'group_wa',
-                target: link,
-                groupName,
-                payload,
-                delay,
-                severity,
-                status: 'sent',
-                userAgent,
-                ip
+                target: link, groupName,
+                payload, delay, severity,
+                status: 'sent', userAgent, ip
             });
-        } else {
-            /* Update log yang sudah ada */
-            try {
-                await db.collection('bug_logs').doc(logId).update({
-                    status: 'processing',
-                    processedAt: FieldValue.serverTimestamp()
-                });
-            } catch (e) { /* silent */ }
         }
 
-        /* ==== 2. NOTIF TELEGRAM ==== */
+        /* Notif Telegram */
         await sendBugNotification({
             source: 'group_wa',
             username,
             bugName: bugName || bugType,
             bugId: bugType,
             category: 'group_wa',
-            target: link,
-            groupName,
-            payload,
-            delay,
-            severity,
-            userAgent
+            target: link, groupName,
+            payload, delay, severity, userAgent
         });
 
-        /* ==== 3. SIMULASI ==== */
-        await new Promise(r => setTimeout(r, delay || BUG_EXEC_CONFIG.simDelay));
+        /* Simulasi */
+        await sleep(delay || CONFIG.BUG_SIM_DELAY);
 
-        /* ================================================
-           ⚠️ EKSEKUSI REAL DI SINI
-           ================================================ */
+        /* TODO: EKSEKUSI REAL DI SINI */
 
-        /* ==== 4. UPDATE LOG ==== */
+        /* Update log */
         if (logId) {
             try {
                 await db.collection('bug_logs').doc(logId).update({
@@ -2359,7 +2456,6 @@ app.post('/bug/group/execute', async (req, res) => {
             } catch (e) { /* silent */ }
         }
 
-        /* ==== 5. RESPON ==== */
         res.json({
             ok: true,
             logId,
@@ -2372,15 +2468,13 @@ app.post('/bug/group/execute', async (req, res) => {
         });
 
     } catch (e) {
-        console.error('❌ Group bug error:', e);
+        logger.error('Group bug error:', e);
         res.status(500).json({ ok: false, error: e.message });
     }
 });
 
-/* ==========================================================
-   ENDPOINT: GET /bug/logs  (lihat riwayat, opsional)
-   ========================================================== */
-app.get('/bug/logs', async (req, res) => {
+/* ---------- GET /bug/logs ---------- */
+app.get('/bug/logs', requireApiKey, async (req, res) => {
     try {
         const limit = Math.min(parseInt(req.query.limit) || 20, 100);
         const snap = await db.collection('bug_logs')
@@ -2410,212 +2504,55 @@ app.get('/bug/logs', async (req, res) => {
 });
 
 /* ==========================================================
-   BOT COMMAND: /bugstats — cek statistik bug
+   ERROR HANDLERS
    ========================================================== */
-bot.onText(/\/bugstats/, async (msg) => {
-    if (msg.from.id !== CONFIG.OWNER_ID) return;
+process.on('uncaughtException', (e) => {
+    logger.error('Uncaught Exception:', e);
+});
 
-    try {
-        bot.sendChatAction(msg.chat.id, 'typing');
+process.on('unhandledRejection', (e) => {
+    logger.error('Unhandled Rejection:', e);
+});
 
-        const snap = await db.collection('bug_logs').get();
-        const stats = {
-            total: snap.size,
-            direct: 0,
-            group_wa: 0,
-            withPayload: 0,
-            withoutPayload: 0,
-            byBug: {}
-        };
-
-        snap.forEach(d => {
-            const x = d.data();
-            if (x.source === 'group_wa') stats.group_wa++;
-            else stats.direct++;
-
-            if (x.hasPayload || (x.payload && x.payload.trim())) stats.withPayload++;
-            else stats.withoutPayload++;
-
-            const key = x.bugName || 'unknown';
-            stats.byBug[key] = (stats.byBug[key] || 0) + 1;
-        });
-
-        /* Top 5 bugs */
-        const topBugs = Object.entries(stats.byBug)
-            .sort((a, b) => b[1] - a[1])
-            .slice(0, 5);
-
-        let text = `🐛 *BUG STATISTICS*\n━━━━━━━━━━━━━━━━━━\n\n`;
-        text += `📊 Total: *${stats.total}*\n`;
-        text += `💥 Direct: *${stats.direct}*\n`;
-        text += `💬 Group WA: *${stats.group_wa}*\n\n`;
-        text += `📦 With Payload: *${stats.withPayload}*\n`;
-        text += `⚠️ Without Payload: *${stats.withoutPayload}*\n\n`;
-        text += `🏆 *Top Bugs:*\n`;
-        topBugs.forEach(([name, count], i) => {
-            text += `${i + 1}. ${name} — *${count}x*\n`;
-        });
-
-        bot.sendMessage(msg.chat.id, text, { parse_mode: 'Markdown' });
-    } catch (e) {
-        bot.sendMessage(msg.chat.id, '❌ Error: ' + e.message);
-    }
+process.on('SIGTERM', () => {
+    logger.info('SIGTERM received, shutting down...');
+    if (bot) bot.stopPolling();
+    process.exit(0);
 });
 
 /* ==========================================================
-   BOT COMMAND: /bugrecent — 10 bug terakhir
+   START SERVER
    ========================================================== */
-bot.onText(/\/bugrecent(?:\s+(\d+))?/, async (msg, match) => {
-    if (msg.from.id !== CONFIG.OWNER_ID) return;
-
-    const limit = Math.min(parseInt(match[1]) || 10, 30);
-
-    try {
-        bot.sendChatAction(msg.chat.id, 'typing');
-
-        const snap = await db.collection('bug_logs')
-            .orderBy('createdAt', 'desc')
-            .limit(limit)
-            .get();
-
-        if (snap.empty) {
-            return bot.sendMessage(msg.chat.id, '📭 Belum ada log bug');
-        }
-
-        let text = `🐛 *${limit} BUG TERAKHIR*\n━━━━━━━━━━━━━━━━━━\n\n`;
-        let idx = 1;
-
-        snap.forEach(d => {
-            const x = d.data();
-            const time = x.createdAt?.toDate
-                ? x.createdAt.toDate().toLocaleString('id-ID', {
-                    timeZone: 'Asia/Jakarta',
-                    hour: '2-digit',
-                    minute: '2-digit',
-                    day: '2-digit',
-                    month: '2-digit'
-                })
-                : '-';
-            const payloadIcon = x.hasPayload ? '✅' : '⚠️';
-            const sourceIcon = x.source === 'group_wa' ? '💬' : '💥';
-
-            text += `*${idx++}.* ${sourceIcon} ${x.bugName || '-'}\n`;
-            text += `   👤 \`${x.username || '-'}\`\n`;
-            text += `   🎯 \`${String(x.target || '-').slice(0, 30)}\`\n`;
-            text += `   ${payloadIcon} Payload: ${x.payloadLength || 0} chars\n`;
-            text += `   🕐 ${time}\n\n`;
-        });
-
-        bot.sendMessage(msg.chat.id, text, { parse_mode: 'Markdown' });
-    } catch (e) {
-        bot.sendMessage(msg.chat.id, '❌ Error: ' + e.message);
-    }
-});
-
-/* ==========================================================
-   BOT COMMAND: /bugnotif — toggle notifikasi bug
-   ========================================================== */
-bot.onText(/\/bugnotif(?:\s+(on|off))?/, async (msg, match) => {
-    if (msg.from.id !== CONFIG.OWNER_ID) return;
-
-    const arg = match[1]?.toLowerCase();
-
-    if (!arg) {
-        const status = BUG_EXEC_CONFIG.notifEnabled ? '✅ ON' : '🚫 OFF';
-        return bot.sendMessage(msg.chat.id,
-            `🔔 *Bug Notif:* ${status}\n\n` +
-            `Gunakan: \`/bugnotif on\` atau \`/bugnotif off\``,
-            { parse_mode: 'Markdown' }
-        );
-    }
-
-    BUG_EXEC_CONFIG.notifEnabled = (arg === 'on');
-    bot.sendMessage(msg.chat.id,
-        `🔔 Bug notif: *${BUG_EXEC_CONFIG.notifEnabled ? 'AKTIF' : 'NONAKTIF'}*`,
-        { parse_mode: 'Markdown' }
-    );
-});
-
-/* ==========================================================
-   BOT COMMAND: /bugtest — test notif bug
-   ========================================================== */
-bot.onText(/\/bugtest/, async (msg) => {
-    if (msg.from.id !== CONFIG.OWNER_ID) return;
-
-    await sendBugNotification({
-        source: 'direct',
-        username: 'test_user',
-        bugName: 'Crash Force Close',
-        bugId: 'crash_crash_force_close',
-        category: 'crash',
-        target: '628123456789',
-        payload: `[TEST_PAYLOAD]\ntarget: 628123456789\nmethod: force_close\nintensity: 9\nnotes: Ini pesan test untuk cek notifikasi`,
-        delay: 1500,
-        severity: 'high',
-        userAgent: 'Mozilla/5.0 (Test)'
-    });
-
-    bot.sendMessage(msg.chat.id, '✅ Test notif terkirim ke admin chat');
-});
-
-/* ==========================================================
-   BOT COMMAND: /bughelp — bantuan
-   ========================================================== */
-bot.onText(/\/bughelp/, (msg) => {
-    if (msg.from.id !== CONFIG.OWNER_ID) return;
-
-    const text = `🐛 *BUG COMMANDS*\n━━━━━━━━━━━━━━━━━━\n\n` +
-        `• /bugstats — Statistik semua bug\n` +
-        `• /bugrecent [n] — n bug terakhir (default 10)\n` +
-        `• /bugnotif [on/off] — Toggle notifikasi bug\n` +
-        `• /bugtest — Test kirim notif bug\n` +
-        `• /bughelp — Bantuan ini\n\n` +
-        `_Setiap user kirim bug → notif masuk otomatis_`;
-
-    bot.sendMessage(msg.chat.id, text, { parse_mode: 'Markdown' });
-});
-
-/* ==========================================================
-   STARTUP LOG
-   ========================================================== */
-console.log('');
-console.log('🐛 ═══════════════════════════════════════════');
-console.log('   UNIVERSAL BUG EXECUTOR v1.0');
-console.log('   ───────────────────────────────────────');
-console.log('   ✅ POST /bug/execute        (Crash/Freeze/Spam)');
-console.log('   ✅ POST /bug/group/execute  (Group WA)');
-console.log('   ✅ GET  /bug/logs           (Riwayat)');
-console.log('   ✅ Telegram notif: ' + (BUG_EXEC_CONFIG.notifEnabled ? 'ON' : 'OFF'));
-console.log('   ✅ Notif chat: ' + (BUG_EXEC_CONFIG.NOTIF_CHAT || '(belum diset)'));
-console.log('   ───────────────────────────────────────');
-console.log('   Bot commands:');
-console.log('   /bugstats  /bugrecent  /bugnotif  /bugtest  /bughelp');
-console.log('🐛 ═══════════════════════════════════════════');
-console.log('');
-
 const server = app.listen(CONFIG.PORT, () => {
     console.log('');
-    console.log('╔══════════════════════════════════════════════╗');
-    console.log('║   ⚔️  ZEYRON COMMAND BOT v7.1.0              ║');
-    console.log('╠══════════════════════════════════════════════╣');
-    console.log(`║   🌐  Port      : ${String(CONFIG.PORT).padEnd(27)}║`);
-    console.log(`║   💳  Provider  : ${CONFIG.PAYMENT_PROVIDER.padEnd(27)}║`);
-    console.log(`║   🤖  Bot       : Active                     ║`);
-    console.log(`║   🔥  Firebase  : Connected                  ║`);
-    console.log('╠══════════════════════════════════════════════╣');
-    console.log('║   🎁  Custom User: ENABLED                   ║');
-    console.log('║   📦  Pool System: ENABLED                   ║');
-    console.log('║   🔐  Dual-Write: ENABLED                    ║');
-    console.log('║   👑  Multi-Role: ENABLED                    ║');
-    console.log('╚══════════════════════════════════════════════╝');
+    console.log('╔══════════════════════════════════════════════════╗');
+    console.log('║   ⚔️  ZEYRON COMMAND BOT v8.0 ULTIMATE           ║');
+    console.log('╠══════════════════════════════════════════════════╣');
+    console.log(`║   🌐  Port       : ${String(CONFIG.PORT).padEnd(29)}║`);
+    console.log(`║   💳  Provider   : ${CONFIG.PAYMENT_PROVIDER.padEnd(29)}║`);
+    console.log(`║   🤖  Bot        : Active                        ║`);
+    console.log(`║   🔥  Firebase   : Connected                     ║`);
+    console.log(`║   🔍  Verbose    : ${(CONFIG.VERBOSE ? 'ON' : 'OFF').padEnd(29)}║`);
+    console.log('╠══════════════════════════════════════════════════╣');
+    console.log('║   🎁  Custom User     : ENABLED                  ║');
+    console.log('║   📦  Pool System     : ENABLED                  ║');
+    console.log('║   🔐  Dual-Write      : ENABLED                  ║');
+    console.log('║   👑  Multi-Role      : ENABLED                  ║');
+    console.log('║   🐛  Bug Executor    : ENABLED                  ║');
+    console.log('║   🔑  API Key Auth    : ENABLED                  ║');
+    console.log('║   🚦  Rate Limiting   : ENABLED                  ║');
+    console.log('║   📏  Payload Limit   : ENABLED                  ║');
+    console.log('╚══════════════════════════════════════════════════╝');
     console.log('');
-    console.log('Commands:');
-    console.log('  /generate <type> [hari] [user] [pass]');
-    console.log('  /bulk <n> <type> [hari]');
-    console.log('  /cheername>');
-    console.log('  /testlogin <user> <pass>');
-    console.log('  /syncusers');
-    console.log('  /fixuser <username>');
-    console.log('  /diag');
+    console.log('📌 Commands:');
+    console.log('   /generate <type> [hari] [user] [pass]');
+    console.log('   /bulk <n> <type> [hari]');
+    console.log('   /checkuser /testlogin /fixuser /syncusers /diag');
+    console.log('   /bugstats /bugrecent /bugnotif /bugtest');
     console.log('');
-})
+    console.log('🔐 Security:');
+    console.log('   API Key  : ' + (CONFIG.BUG_API_KEY ? '✅ Set' : '❌ Kosong'));
+    console.log('   Rate Lim : ' + CONFIG.BUG_RATE_LIMIT.perMinute + '/min, ' +
+                                   CONFIG.BUG_RATE_LIMIT.perHour + '/jam');
+    console.log('');
+});
