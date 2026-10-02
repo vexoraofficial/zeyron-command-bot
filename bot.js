@@ -536,7 +536,7 @@ async function sendAccountMessage(chatId, acc, extra = {}) {
     const durText = acc.days ? `${acc.days} hari`
                   : (acc.permanent ? 'Permanent' : '-');
 
-    const customTag = acc.isCustom ? '\n🎨 *CUSTOM* oleh owner' : '';
+    const customTag = acc.isCustom ? '\n🔨🔧 *DI-GENERATE* oleh Developer!' : '';
 
     let text = `✅ *AKUN SIAP LOGIN*${customTag}\n\n`;
     text += `📦 Tipe: *${escapeMarkdown(acc.typeName)}*\n`;
@@ -548,7 +548,7 @@ async function sendAccountMessage(chatId, acc, extra = {}) {
     text += `🔑 Password: \`${acc.password}\`\n`;
     text += `━━━━━━━━━━━━━━━━━━\n`;
     text += `💾 Pool: available ✅\n`;
-    text += `🔐 Login: *index.html* siap ✅`;
+    text += `🔐 Login: siap dilakukan ✅`;
 
     if (extra.footer) text += '\n\n' + extra.footer;
 
@@ -997,7 +997,7 @@ bot.onText(/\/generate\s+(\S+)(?:\s+(\S+))?(?:\s+(\S+))?(?:\s+(\S+))?/, async (m
         bot.sendChatAction(msg.chat.id, 'typing');
         const acc = await generateAccount(typeId, days, 'owner_manual', customUser, customPass);
         await sendAccountMessage(msg.chat.id, acc, {
-            footer: acc.isCustom ? '🎨 Akun custom berhasil dibuat!' : undefined
+            footer: acc.isCustom ? '📄 Akun baru berhasil dibuat! 📄' : undefined
         });
     } catch (e) {
         logger.error('Generate error:', e);
